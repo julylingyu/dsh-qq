@@ -116,6 +116,34 @@ AI **收藏**群友的表情、**发送**收藏表情时，桥接会先自己下
 只在网关是 NapCat 时用到：NapCat 的 `add_custom_face` 只接受本地文件路径，桥接会把已校验的表情字节写成一个随机名、权限 0600 的临时文件交给它，调用结束立即删除。
 留空时：macOS 用 QQ 沙盒容器里的 `~/Library/Containers/com.tencent.qq/Data/tmp`（App Store 版 QQ 读不到系统临时目录），其它系统用系统临时目录。SnowLuma 不用这个目录。
 
+## `socialV2.image.allowRoots` —— `qq_send_image` 的本机路径白名单（默认 `["E:\\dsh\\dsh-qq", "E:\\dsh"]`）
+
+`qq_send_image` 支持两种来源：`url`（桥接内部下载、校验图片签名）和 `path`（本机文件）。`path` 等于「读本机文件并外发」，所以只允许落在白名单目录之下，其它一律 403 并回显允许的目录。
+
+- 留空或缺省时用内置默认：仓库目录 + DSH 工作区（`E:\dsh`）。
+- 配了就只用配置的项；相对路径按桥接进程 cwd 解析，`..` 逃逸与兄弟目录（如 `E:\dsh-evil`）都拒绝。
+- 只影响 `path`；`url` 走 SSRF 防护，不看这个白名单。
+
+## `socialV2.media.video` —— QQ 视频消息抽帧识别（本仓库增强）
+
+DSH 的模型输入只有图片，没有视频通道。所以收到 QQ 视频（OneBot `video` 段）时，桥接会先用 ffmpeg 在本地抽若干关键帧，再把帧当作图片交给视觉模型——群里发视频，AI 就能"看"到画面内容（听不到声音）。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关。关掉后视频只显示 `[视频]` 占位 |
+| `ffmpegPath` | `""` | ffmpeg 可执行文件路径。留空时依次找 `PATH`、常见安装位置；找不到会启动日志告警 |
+| `maxBytes` | `52428800` | 单个视频文件上限（下载与本地读取都受约束），范围 1MB～200MB |
+| `frames` | `6` | 每个视频抽几张关键帧（1～12），与图片共用单条消息的 `socialV2.media.maxCount` 预算 |
+| `maxWidth` | `720` | 帧的最大宽度（等比缩放、不放大），160～1280 |
+| `timeoutMs` | `60000` | 单次 ffmpeg 任务超时，5s～180s |
+| `localRoots` | `[]` | 额外的本地路径白名单（网关只给本地缓存文件时用），默认只允许 SnowLuma 安装目录、仓库目录与系统临时目录 |
+
+- 帧会均匀分布在整段视频上（按时长算 fps）；读不出时长时退回关键帧（I 帧），再退回 `fps=1`。
+- **QQ 短视频会伪装成 image 段**：URL 指向 `multimedia.nt.qq.com.cn` 且带 `appid=1415` / `orgfmt=t264`（内容其实是 mp4）。桥接会按 URL/文件名把这类媒体识别成视频并抽帧，不要求网关一定发 `video` 段。
+- 视频段的 CDN 地址走 `safeFetchBinary` 下载：与图片相同的 SSRF/跳转/大小防护，但不校验图片签名。
+- 视频段如果只有 CDN URL，走与图片相同的安全下载（DNS 固定、跳转逐跳校验、大小上限）；只有本地路径时，路径必须落在 `localRoots` / 默认白名单内且扩展名像视频，否则拒绝并写日志。
+- 模型不能看图（`dsh.vision` 判定为不能）时不做抽帧，视频显示为文字占位。
+
 ## `dsh.provider` / `dsh.model` / `dsh.reasoningEffort` / `dsh.vision` —— 模型选择（v1.0.2 起可在控制台改）
 
 推荐在桥接控制台「运行总览 → DSH 模型与思考强度」里选：提供方、模型、思考强度三个下拉联动，选项全部来自 DSH 的模型目录（`session.modelCatalog`），

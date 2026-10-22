@@ -335,6 +335,7 @@ const TOOL_CONFIG_FLAGS = {
   // token 才改注册期过滤的），又诱导模型误调。`qq_set_sticker_remark` 默认就是 `false`
   // （见 bridge.js 的 socialV2.tools 默认表），所以此前它一直是"默认关闭却仍然可见"。
   qq_send_poke: 'sendPoke',
+  qq_send_image: 'sendImage',
   qq_get_message_images: 'getImages',
   qq_get_forward_msg: 'getForwardMsg',
   qq_list_stickers: 'listStickers',
@@ -773,6 +774,40 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
   );
 }
 
+if (cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_send_image',
+    '发一张图片到指定会话（群聊或私聊）：贴截图、发照片、发网上的图。url 与 path 二选一 —— url 必须是 http(s)（桥接内部完成下载，不把地址交给网关），path 是这台机器上的图片文件绝对路径。只接受 png/jpg/gif/webp/bmp，最大 8MB。图片只能单独成一条消息、不能同气泡附文字：想配一句话，先用 qq_send_message 发文字再发图。受白名单、静默模式与发送频率限制。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      url: z.string().optional().describe('图片的 http(s) 地址（与 path 二选一）'),
+      path: z.string().optional().describe('本机图片文件的绝对路径（与 url 二选一）'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（可选，非零整数，可为负数）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（可选，群聊有效）')
+    },
+    async ({ key, token, url, path: filePath, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            url: url ?? '',
+            path: filePath ?? '',
+            replyToMessageId: replyToMessageId != null ? String(replyToMessageId) : '',
+            atUserId: atUserId != null ? String(atUserId) : ''
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发图失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 server.tool(
   'qq_wait_for_messages',
   '等待分两种用途。首答前已读消息、只想确认有没有补充：用 purpose="reply"，按最后来信时间补足 quietMs 静默，已安静足够就立即返回；读取/思考时新到的消息也会返回，新消息重算静默。timeoutMs 是最长预算，不要求等满；预算到但 quiet=false 不代表对方已说完。此用途绝不代替沉睡前观察。等对方继续说、等回复或睡前观察：用默认 purpose="messages"；先等新消息，收到后才按 quietMs 等静默，没有新消息会等到 timeoutMs，单传 quietMs 不会缩短总等待。静默下限由后台配置，默认 10000ms。直接看 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询；仍有未展示未读才补读。决定潜水/收尾时才用默认用途加 timeoutMs=300000 完成沉睡前观察，不能把 5 分钟观察放在首答之前；短等待不能代替。全程无人说话返回 preSleepWaitSatisfied=true；观察期间来了新消息返回 preSleepWaitObserved=true，读后不需参与可收尾，参与回复则下次收尾重新观察。preSleepWaitRemainingMs 仅供准备收尾时参考。',
@@ -1020,7 +1055,7 @@ server.tool(
 if (cfg.socialV2?.tools?.getImages !== false) {
   server.tool(
     'qq_get_message_images',
-    '获取指定 QQ 消息中的图片/表情，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情] 或 hasMedia=true 时调用。支持一条消息里的多张图片/表情；二代模式下必须携带会话令牌。',
+    '获取指定 QQ 消息中的图片/表情/视频，并直接以图像内容返回给模型（视觉模型可“看懂”）。当消息文本里出现 [图片]、[表情]、[视频] 或 hasMedia=true 时调用。视频会在桥接侧用 ffmpeg 抽取若干关键帧后以图片形式返回；二代模式下必须携带会话令牌。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       messageId: z.union([z.number(), z.string()]).describe('要查看的消息 id（QQ 消息 id 可为负数；二代也可用本地 seq）'),
@@ -1040,11 +1075,12 @@ if (cfg.socialV2?.tools?.getImages !== false) {
         const content = [];
         const textParts = [];
         for (const img of images) {
+          const kindLabel = img.kind === 'face' ? '表情' : (img.kind === 'video' ? '视频帧' : '图片');
           if (img?.data && img?.mimeType) {
-            textParts.push(`[${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : ''}]`);
+            textParts.push(`[${kindLabel}${img.index ?? ''}${img.text ? ' ' + img.text : ''}]`);
             content.push({ type: 'image', mimeType: img.mimeType, data: img.data });
           } else {
-            textParts.push(`[${img.kind === 'face' ? '表情' : '图片'}${img.index ?? ''}${img.text ? ' ' + img.text : '（获取失败）'}]`);
+            textParts.push(`[${kindLabel}${img.index ?? ''}${img.text ? ' ' + img.text : '（获取失败）'}]`);
           }
         }
         if (textParts.length) {

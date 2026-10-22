@@ -202,6 +202,7 @@
       "getImages": true,
       "getForwardMsg": true,
       "sendPoke": true,
+      "sendImage": true,
       "listStickers": true,
       "getStickerImage": true,
       "sendSticker": true,
@@ -336,7 +337,16 @@
     "media": {
       "maxBytes": 8388608,
       "maxPixels": 64000000,
-      "maxCount": 5
+      "maxCount": 5,
+      "video": {
+        "enabled": true,
+        "ffmpegPath": "",
+        "maxBytes": 52428800,
+        "frames": 6,
+        "maxWidth": 720,
+        "timeoutMs": 60000,
+        "localRoots": []
+      }
     }
   },
   "webSearch": {

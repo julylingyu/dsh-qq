@@ -21,12 +21,15 @@ import { mdToPlain, splitForQQ, truncateText, truncateTextTail } from './md-to-p
 import { SENSITIVE_RE } from './sensitive.js';
 import { looksLikeUnfinished } from './v2-wait.js';
 import { compactModelMessage } from './qq-model-view.js';
-import { safeFetchBuffer, looksLikeImageBuffer } from './safe-fetch.js';
+import { safeFetchBuffer, safeFetchBinary, looksLikeImageBuffer } from './safe-fetch.js';
+import { extractVideoFramesFromBuffer, extractVideoFramesFromFile, looksLikeVideoFile, resolveFfmpeg } from './video-frames.mjs';
 import { stickerMaxBytes } from './lib/sticker-limits.mjs';
 import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, inspectAudio, listAudioFiles, parseTargetKey, processAudioVolume, resolveAudioProcessing, resolveAudioSource, safeJoinLibrary } from './send-voice-lib.js';
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import { describeCardSegment } from './card-text.js';
+import { normalizeImageRoots, isPathInsideRoots, describeImageRoots } from './image-path.js';
 import {
   createSlowFetchCache,
   pendingReplyText,
@@ -810,6 +813,7 @@ function loadConfig() {
         getImages: true,
         getForwardMsg: true,
         sendPoke: true,
+        sendImage: true,
         listStickers: true,
         getStickerImage: true,
         sendSticker: true,
@@ -941,6 +945,7 @@ function loadConfig() {
     getImages: true,
     getForwardMsg: true,
     sendPoke: true,
+    sendImage: true,
     listStickers: true,
     getStickerImage: true,
     sendSticker: true,
@@ -1011,12 +1016,31 @@ function loadConfig() {
 
   // socialV2.media：图片/表情的数量与体积上限。旧配置没有这一段，必须深度合并出默认值，
   // 否则 `{...defaults, ...file.socialV2}` 里缺失的 media 会取到 undefined（等于无上限判断）。
-  cfg.socialV2.media = {
-    maxBytes: 8 * 1024 * 1024,
-    maxPixels: 64_000_000,
-    maxCount: 5,
-    ...((cfg.socialV2?.media && typeof cfg.socialV2.media === 'object' && !Array.isArray(cfg.socialV2.media)) ? cfg.socialV2.media : {})
-  };
+  {
+    const rawMedia = (cfg.socialV2?.media && typeof cfg.socialV2.media === 'object' && !Array.isArray(cfg.socialV2.media))
+      ? cfg.socialV2.media
+      : {};
+    // socialV2.media.video：QQ 视频消息 → ffmpeg 抽关键帧 → 当作图片交给视觉模型（见 src/video-frames.mjs）。
+    // frames 与图片共用单条消息的 maxCount；maxBytes 是单个视频文件的下载/读取上限。
+    const rawVideo = (rawMedia.video && typeof rawMedia.video === 'object' && !Array.isArray(rawMedia.video))
+      ? rawMedia.video
+      : {};
+    cfg.socialV2.media = {
+      maxBytes: 8 * 1024 * 1024,
+      maxPixels: 64_000_000,
+      maxCount: 5,
+      ...rawMedia,
+      video: {
+        enabled: true,                 // 总开关：关掉后视频只显示 [视频] 占位
+        ffmpegPath: '',                // 空 = 依次找 PATH / 常见安装位置
+        maxBytes: 50 * 1024 * 1024,    // 单个视频文件大小上限
+        frames: 6,                     // 每个视频抽几张关键帧
+        maxWidth: 720,                 // 帧的最大宽度（等比缩放，不放大）
+        timeoutMs: 60000,              // 单次 ffmpeg 超时
+        ...rawVideo
+      }
+    };
+  }
 
   // socialV2.initialPromptMaxChars：会话「初始提示词」的字数上限。config.json 是用户可编辑的，
   // 手工写进字符串/负数/超大值时要收敛到安全区间，否则要么保存接口永远报"过长"，要么等于没上限。
@@ -1354,7 +1378,26 @@ async function segmentsToText(segments, options = {}) {
       case 'image': out.push('[图片]'); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
-      case 'file': out.push(`[文件${d.name ?? ''}]`); break;
+      case 'file': {
+        // 文件消息：名字和大小总是给；文本类小文件（≤512KB）顺带把内容读进来，
+        // 群里甩个 txt/log 让 AI 看是最常见的用法。读不到就只给元信息，不报错。
+        const name = String(d.name ?? d.file ?? '').trim();
+        const size = Number(d.file_size ?? d.size) || 0;
+        const sizeText = size > 0 ? ` ${formatBytes(size)}` : '';
+        let body = '';
+        const textLike = /\.(txt|md|markdown|log|json|ya?ml|csv|ini|conf|env|js|mjs|cjs|ts|py|java|c|cpp|h|css|html?|xml|sql|sh|bat|ps1)$/i.test(name);
+        const fileUrl = String(d.url ?? d.file_url ?? '').trim();
+        if (textLike && /^https?:\/\//i.test(fileUrl) && (size === 0 || size <= 512 * 1024)) {
+          try {
+            // 必须用 safeFetchBinary：safeFetchBuffer 会强制图片签名校验，文本文件永远读不进来。
+            const got = await safeFetchBinary(fileUrl, 512 * 1024);
+            const text = got.buffer.toString('utf8').replace(/^\uFEFF/, '');
+            body = `\n--- 文件内容（最多 1500 字）---\n${truncateText(text, 1500)}`;
+          } catch {}
+        }
+        out.push(`[文件${name ? `:${name}` : ''}${sizeText}]${body}`);
+        break;
+      }
       case 'reply': {
         // 引用/回复段：默认解析成「被引用人 + 原文」，让 AI 能判断这句话是对谁说的；
         // includeReply=false 时跳过该段，得到“当前消息自己的文字”（用于指令/指向性判断）。
@@ -1370,14 +1413,24 @@ async function segmentsToText(segments, options = {}) {
               const parts = [];
               if (info.sender) parts.push(info.sender);
               if (info.text) parts.push(info.text);
-              replyText = `[引用 ${parts.join('：')}]`;
+              // 被引用消息自带媒体（尤其是视频）时给出可操作的提示：模型据此用 qq_get_message_images 看画面。
+              let mediaHint = '';
+              if (Array.isArray(info.media) && info.media.length) {
+                const hasVideo = info.media.some((m) => mediaIsVideo(m));
+                const idText = d.id != null ? `消息ID=${String(d.id)}，` : '';
+                mediaHint = `（含${hasVideo ? '视频' : '图片/表情'}，${idText}可用 qq_get_message_images 查看）`;
+              }
+              replyText = `[引用 ${parts.join('：')}${mediaHint}]`;
             }
           } catch {}
         }
         out.push(replyText || '[引用消息]');
         break;
       }
-      case 'json': out.push('[卡片消息]'); break;
+      // 小程序 / 分享链接 / 音乐卡片：业务 JSON 在 d.data 里，把 prompt、标题、描述抠出来，
+      // 别再只丢一个 "[卡片消息]" 给模型（解析失败仍退回该占位，见 src/card-text.js）。
+      case 'json':
+      case 'ark': out.push(describeCardSegment(d)); break;
       // markdown：SnowLuma 1.14.9 的线上段落是 `{type:'markdown',data:{content}}`。
       // 上游 1.14.17+（commit 1934e4e7「include text alongside received markdown」）
       // 起还会带上 `data.text`。两个形状都读，这样将来升级 SnowLuma 运行时不会退化成
@@ -1404,7 +1457,26 @@ function sanitizeMediaSummary(value, max = 60) {
   return s ? truncateText(s, max) : '';
 }
 
-// 从 OneBot 消息段中提取图片/表情元数据（不下载字节，仅记录定位信息）。
+// QQ 的「视频消息」在 OneBot 里经常以 **image 段**下发：URL 指向 multimedia.nt.qq.com.cn
+// 且带 appid=1415 / orgfmt=t264（内容是 mp4/h264 视频，不是图片）。历史消息里存的也是
+// kind:'image'，所以除了 video 段，还要靠 URL/文件名把这类媒体识别成视频，交给 ffmpeg 抽帧。
+function isLikelyVideoUrl(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return false;
+  if (/[?&]appid=1415(?:&|$)/.test(s)) return true;                       // QQ 短视频
+  if (/[?&]orgfmt=(?:t264|h264|h265|hevc|mp4|av1)(?:&|$)/i.test(s)) return true;
+  return /\.(?:mp4|m4v|mov|avi|mkv|webm|flv|wmv|ts|3gp)(?:[?#]|$)/i.test(s);
+}
+
+/** 这个媒体条目是不是视频（显式 video 段，或 image 段里藏着视频 URL/文件名）。 */
+function mediaIsVideo(media) {
+  if (!media || typeof media !== 'object') return false;
+  if (media.kind === 'video') return true;
+  if (isLikelyVideoUrl(media.url) || isLikelyVideoUrl(media.path)) return true;
+  return looksLikeVideoFile(media.file);
+}
+
+// 从 OneBot 消息段中提取图片/表情/视频元数据（不下载字节，仅记录定位信息）。
 // 供一代自动内联、二代按需工具、控制台/日志使用。
 //
 // 字段必须尽量保留：SnowLuma 收到的 QQ 表情包（收藏/市场表情）是 **image 段 +
@@ -1422,17 +1494,22 @@ function extractMediaFromSegments(segments) {
       emojiKey: String(d.key ?? '')
     };
     if (seg.type === 'image') {
-      media.push({
+      // 线上段落字段是 snake_case 的 `sub_type`（SnowLuma 运行时源码里就这么发）；
+      // 而 SDK 的类型描述的是**内部元素**、拼作 `subType`。两个都读，别只认一个
+      // —— 只读 camelCase 的话这里会永远是空串，而且不会有任何报错。
+      const entry = {
         kind: 'image',
         file: String(d.file ?? ''),
         url: String(d.url ?? ''),
-        // 线上段落字段是 snake_case 的 `sub_type`（SnowLuma 运行时源码里就这么发）；
-        // 而 SDK 的类型描述的是**内部元素**、拼作 `subType`。两个都读，别只认一个
-        // —— 只读 camelCase 的话这里会永远是空串，而且不会有任何报错。
         subType: (d.sub_type ?? d.subType) != null ? String(d.sub_type ?? d.subType) : '',
         summary: sanitizeMediaSummary(d.summary),
         ...emojiFields
-      });
+      };
+      // QQ 短视频会伪装成 image 段下发（url 指向 t264/appid=1415 的视频）：改标成 video，后面走抽帧。
+      if (!entry.emojiId && !entry.emojiPackageId && (isLikelyVideoUrl(entry.url) || looksLikeVideoFile(entry.file))) {
+        entry.kind = 'video';
+      }
+      media.push(entry);
     } else if (seg.type === 'mface') {
       // 市场表情（mface）：没有 image 段可用，emoji_id/url 是唯一来源。
       media.push({
@@ -1442,6 +1519,15 @@ function extractMediaFromSegments(segments) {
         subType: '1',
         summary: sanitizeMediaSummary(d.summary),
         ...emojiFields
+      });
+    } else if (seg.type === 'video') {
+      // QQ 视频消息：只记录定位信息（CDN URL / 网关缓存路径），真正抽帧在 resolveMediaList / fetchMediaData 里做。
+      media.push({
+        kind: 'video',
+        file: String(d.file ?? ''),
+        url: String(d.url ?? ''),
+        path: String(d.path ?? ''),
+        summary: sanitizeMediaSummary(d.summary)
       });
     } else if (seg.type === 'face') {
       media.push({
@@ -4932,7 +5018,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'personProfile', 'requestMode', 'crossGroup', 'ownerRelay', 'ownerGroupAccess', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'sendImage', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'personProfile', 'requestMode', 'crossGroup', 'ownerRelay', 'ownerGroupAccess', 'sendVoice'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -5191,6 +5277,7 @@ async function main() {
             getImages: 'qq_get_message_images',
             getForwardMsg: 'qq_get_forward_msg',
             sendPoke: 'qq_send_poke',
+            sendImage: 'qq_send_image',
             listStickers: 'qq_list_stickers',
             getStickerImage: 'qq_get_sticker_image',
             sendSticker: 'qq_send_sticker',
@@ -5860,6 +5947,132 @@ async function main() {
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
+          return;
+        }
+        // ── 发图片（Agent 通道）：URL 或本机路径 → 图片段 ─────────────────────
+        // 表情工具只能发收藏表情，这里补「发图」：贴截图、发照片、发网图。
+        // URL 走带 SSRF 防护的 safeFetchBuffer；本机路径必须存在、趁手（≤8MB）且通过图片魔数校验。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-image') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const rawUrl = String(body.url ?? '').trim();
+          const rawPath = String(body.path ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (!rawUrl && !rawPath) { sendJson({ ok: false, error: 'url 和 path 至少给一个' }, 400); return; }
+          if (rawUrl && rawPath) { sendJson({ ok: false, error: 'url 和 path 只能给一个' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送图片必须携带 agent token' }, 403); return; }
+          if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (!v2ToolEnabled('sendImage')) { sendJson({ ok: false, error: '工具未启用：qq_send_image' }, 403); return; }
+          if (socialV2.paused) { sendJson({ ok: false, error: '二代 AI 已暂停，不能发送图片' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '当前模式不允许操作该会话' }, 403);
+            return;
+          }
+          const replyToMessageId = body.replyToMessageId;
+          const atUserId = String(body.atUserId ?? '').trim();
+          const replyText = replyToMessageId != null ? String(replyToMessageId).trim() : '';
+          if (replyText && !/^-?[1-9]\d*$/.test(replyText)) {
+            sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
+            return;
+          }
+          if (atUserId && !/^[1-9]\d*$/.test(atUserId)) {
+            sendJson({ ok: false, error: 'atUserId 必须是正整数 QQ 号，且不能为 all' }, 400);
+            return;
+          }
+          // 私聊没有「@某人」的概念，带 at 段会被网关拒；直接忽略而不是报错。
+          const atTarget = kind === 'group' ? atUserId : '';
+
+          const maxBytes = Math.min(Number(cfg.socialV2?.media?.maxBytes) || 8388608, 8 * 1024 * 1024);
+          let image;
+          try {
+            if (rawUrl) {
+              if (!/^https?:\/\//i.test(rawUrl)) throw new Error('url 必须是 http(s) 地址');
+              const got = await safeFetchBuffer(rawUrl, maxBytes);
+              if (!looksLikeImageBuffer(got.buffer)) throw new Error('目标地址返回的不是可识别的图片');
+              image = { buffer: got.buffer, via: rawUrl };
+            } else {
+              const abs = path.resolve(rawPath);
+              // 路径白名单：发图等价于「读本机文件并外发」，不能让任意路径都行。
+              const allowRoots = normalizeImageRoots(cfg.socialV2?.image?.allowRoots);
+              if (!isPathInsideRoots(abs, allowRoots)) {
+                const denied = new Error(`path 不在允许的目录内（当前允许：${describeImageRoots(allowRoots)}）`);
+                denied.statusCode = 403;
+                throw denied;
+              }
+              const stat = fs.statSync(abs);
+              if (!stat.isFile()) throw new Error('path 不是普通文件');
+              if (stat.size > maxBytes) throw new Error(`图片过大（${formatBytes(stat.size)} > ${formatBytes(maxBytes)}）`);
+              const buffer = fs.readFileSync(abs);
+              if (!looksLikeImageBuffer(buffer)) throw new Error('文件不是可识别的图片格式（png/jpg/gif/webp/bmp）');
+              image = { buffer, via: abs };
+            }
+          } catch (error) {
+            sendJson({ ok: false, error: `读取图片失败：${error?.message ?? error}` }, error?.statusCode === 403 ? 403 : 400);
+            return;
+          }
+
+          const st = getSocialV2State(key);
+          const sendCfg = cfg.socialV2?.send ?? {};
+          const now = Date.now();
+          const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
+          const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
+          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
+          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
+          if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+            return;
+          }
+          st.sendTimes.push(now);
+          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+
+          const segments = [];
+          if (replyText) segments.push({ type: 'reply', data: { id: replyText } });
+          if (atTarget) segments.push({ type: 'at', data: { qq: atTarget } });
+          segments.push({ type: 'image', data: { file: 'base64://' + image.buffer.toString('base64') } });
+
+          // 成员校验/下载都是异步的，真正发之前再确认一次（期间可能切模式、开静默）。
+          const sendGuard = captureSendGuard(key);
+          try {
+            sendGuard();
+            if (shouldBlockSilentReply(key)) {
+              const blocked = new Error('静默模式已开启，当前不允许发图');
+              blocked.statusCode = 403;
+              throw blocked;
+            }
+            const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+            const params = kind === 'private' ? { user_id: id, message: segments } : { group_id: id, message: segments };
+            await bot.raw(action, params);
+          } catch (error) {
+            // 没发出去就不该吃掉额度：把刚才记进去的发送时刻撤回（否则失败重试会被频率限制挡住）。
+            if (st.sendTimes[st.sendTimes.length - 1] === now) st.sendTimes.pop();
+            log(`[image] 发图失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发送失败：${error?.message ?? error}` }, error?.statusCode === 403 ? 403 : 500);
+            return;
+          }
+          // 自己发的图要进消息流，否则下一轮它不记得刚发过图。
+          const imageText = `[图片] 我发了一张图片${image.via === rawUrl ? '' : `（${path.basename(image.via)}）`}`;
+          st.recentMessages.push({
+            messageId: null, sender: '我', text: imageText, plain: imageText, tail: imageText, kind: 'image',
+            quoteTargetIsSelf: false, isOwner: true, ownerLabel: '我', isSelf: true,
+            media: [], hasMedia: true, forwardIds: [], hasForward: false, time: Date.now()
+          });
+          const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+          if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+          st.preSleepWaitSatisfiedAt = 0;
+          st.preSleepWaitObservedAt = 0;
+          st.preSleepWaitAccumMs = 0;
+          st.lastActionAt = Date.now();
+          st.lastAiReplyAt = Date.now();
+          st.wakeConfig.noActionCount = 0;
+          saveSocialV2State();
+          log(`[image] 发送图片 ${key}（${image.via}，${formatBytes(image.buffer.length)}）`);
+          sendJson({ ok: true, key, via: image.via, bytes: image.buffer.length });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-poke') {
@@ -8290,6 +8503,115 @@ async function main() {
   })(); // 单张图片像素上限，防止“图片炸弹”解码拖垮 DSH
   const MAX_MEDIA_STORE_PER_KEY = 500; // 每个会话最多缓存多少条消息的媒体元数据，防止无限增长
 
+  // 视频抽帧（socialV2.media.video）：所有数值都收敛到安全区间，config.json 手改坏了也不会失控。
+  const VIDEO_CFG = cfg.socialV2?.media?.video ?? {};
+  const VIDEO_ENABLED = VIDEO_CFG.enabled !== false;
+  const VIDEO_MAX_BYTES = (() => {
+    const n = Number(VIDEO_CFG.maxBytes);
+    return Number.isFinite(n) && n > 0 ? Math.min(200 * 1024 * 1024, Math.max(1024 * 1024, Math.round(n))) : 50 * 1024 * 1024;
+  })();
+  const VIDEO_FRAME_COUNT = (() => {
+    const n = Number(VIDEO_CFG.frames);
+    return Number.isFinite(n) && n > 0 ? Math.min(12, Math.max(1, Math.round(n))) : 6;
+  })();
+  const VIDEO_MAX_WIDTH = (() => {
+    const n = Number(VIDEO_CFG.maxWidth);
+    return Number.isFinite(n) && n > 0 ? Math.min(1280, Math.max(160, Math.round(n))) : 720;
+  })();
+  const VIDEO_TIMEOUT_MS = (() => {
+    const n = Number(VIDEO_CFG.timeoutMs);
+    return Number.isFinite(n) && n > 0 ? Math.min(180000, Math.max(5000, Math.round(n))) : 60000;
+  })();
+  const VIDEO_LOCAL_ROOTS = (() => {
+    const roots = [];
+    if (cfg.snowluma?.homeDir) roots.push(String(cfg.snowluma.homeDir));
+    roots.push(ROOT);
+    roots.push(os.tmpdir());
+    const extra = Array.isArray(VIDEO_CFG.localRoots) ? VIDEO_CFG.localRoots : [];
+    for (const r of extra) if (typeof r === 'string' && r.trim()) roots.push(r.trim());
+    return roots;
+  })();
+  const VIDEO_FFMPEG = VIDEO_ENABLED ? resolveFfmpeg(String(VIDEO_CFG.ffmpegPath ?? '')) : null;
+  if (VIDEO_ENABLED && !VIDEO_FFMPEG) {
+    log('⚠️ 视频抽帧已启用但找不到 ffmpeg：QQ 视频将只显示 [视频] 占位（可在 socialV2.media.video.ffmpegPath 指定路径）');
+  } else if (VIDEO_ENABLED) {
+    log(`视频抽帧已启用：ffmpeg=${VIDEO_FFMPEG}，每个视频 ${VIDEO_FRAME_COUNT} 帧 / 宽 ≤${VIDEO_MAX_WIDTH}px / 文件 ≤${Math.round(VIDEO_MAX_BYTES / 1024 / 1024)}MB`);
+  }
+
+  /** 视频本地文件的安全边界：必须在允许的根目录下，且扩展名像视频。 */
+  function isVideoLocalPath(filePath) {
+    try {
+      const real = fs.realpathSync(String(filePath));
+      if (!looksLikeVideoFile(real)) return false;
+      for (const root of VIDEO_LOCAL_ROOTS) {
+        let realRoot;
+        try { realRoot = fs.realpathSync(root); } catch { continue; }
+        if (real === realRoot || real.startsWith(realRoot + path.sep)) return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 读取一个 video 段的字节并抽帧：优先 CDN URL，其次网关给出的本地缓存路径。 */
+  async function fetchVideoFrames(media) {
+    if (!VIDEO_ENABLED) return { frames: [], duration: null, error: '视频抽帧未启用' };
+    if (!VIDEO_FFMPEG) return { frames: [], duration: null, error: '找不到 ffmpeg' };
+    const options = {
+      ffmpegPath: VIDEO_FFMPEG,
+      frames: VIDEO_FRAME_COUNT,
+      maxWidth: VIDEO_MAX_WIDTH,
+      timeoutMs: VIDEO_TIMEOUT_MS
+    };
+    // 同一个视频在一次唤醒里可能被内联一次、又被工具看一次；抽帧是有成本的，缓存 10 分钟。
+    const cacheKey = String(media?.url || media?.path || media?.file || '').trim();
+    if (cacheKey) {
+      const hit = videoFrameCache.get(cacheKey);
+      if (hit && Date.now() - hit.ts < VIDEO_CACHE_TTL_MS) return hit.result;
+    }
+    const remember = (result) => {
+      if (cacheKey && result.frames.length) {
+        videoFrameCache.set(cacheKey, { ts: Date.now(), result });
+        while (videoFrameCache.size > 8) videoFrameCache.delete(videoFrameCache.keys().next().value);
+      }
+      return result;
+    };
+    const url = String(media?.url ?? media?.path ?? '').trim();
+    if (/^https?:\/\//i.test(url)) {
+      try {
+        // 视频 CDN 返回的不是图片，必须走 safeFetchBinary（同样有 SSRF/大小/跳转防护，但不校验图片签名）。
+        const fetched = await safeFetchBinary(url, VIDEO_MAX_BYTES);
+        const result = await extractVideoFramesFromBuffer(fetched.buffer, options);
+        if (!result.frames.length) {
+          log(`[video] 抽帧失败（URL ${url.slice(0, 80)}）：${result.error ?? '未知原因'}`);
+        }
+        return remember(result);
+      } catch (error) {
+        const message = `下载视频失败：${error?.message ?? error}`;
+        log(`[video] ${message}`);
+        return { frames: [], duration: null, error: message };
+      }
+    }
+    // 网关（如 NapCat）有时只给本地缓存路径；只接受允许目录下的视频文件。
+    for (const candidate of [media?.file, media?.path]) {
+      const local = String(candidate ?? '').trim();
+      if (!local) continue;
+      if (!isVideoLocalPath(local)) {
+        if (/[\\/]/.test(local)) log(`[video] 拒绝未授权的本地路径：${local.slice(0, 120)}`);
+        continue;
+      }
+      const result = await extractVideoFramesFromFile(local, options);
+      if (!result.frames.length) {
+        log(`[video] 抽帧失败（本地 ${local.slice(0, 80)}）：${result.error ?? '未知原因'}`);
+      }
+      return remember(result);
+    }
+    return { frames: [], duration: null, error: '视频既没有可下载的 URL，也没有允许的本地缓存路径' };
+  }
+  const videoFrameCache = new Map();
+  const VIDEO_CACHE_TTL_MS = 10 * 60 * 1000;
+
   function isSafeLocalMediaPath(filePath) {
     try {
       const real = fs.realpathSync(String(filePath));
@@ -8463,40 +8785,67 @@ async function main() {
     if (!modelCanSeeImages()) return mediaTextParts(Array.isArray(mediaList) ? mediaList.slice(0, MAX_MEDIA_COUNT) : [], currentModelLabel());
     const parts = [];
     let index = 0;
+    // imageCount 与 index 分开：一个视频会展开成多张帧，帧与图片共用单条消息的 maxCount 预算。
+    let imageCount = 0;
     let totalBytes = 0;
+    const pushImage = (mediaType, buffer, name) => {
+      if (imageCount >= MAX_MEDIA_COUNT) return false;
+      if (totalBytes + buffer.length > MAX_MEDIA_BYTES) return false;
+      imageCount += 1;
+      totalBytes += buffer.length;
+      parts.push({ type: 'image', mediaType, data: buffer.toString('base64'), name });
+      return true;
+    };
     for (const media of Array.isArray(mediaList) ? mediaList : []) {
       index += 1;
-      if (index > MAX_MEDIA_COUNT) {
-        parts.push({ type: 'text', text: `[图片/表情 ${index}（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）]` });
-        continue;
-      }
       if (!media || typeof media !== 'object') continue;
       if (media.kind === 'face') {
+        if (imageCount >= MAX_MEDIA_COUNT) {
+          parts.push({ type: 'text', text: `[表情${index}（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）]` });
+          continue;
+        }
         const face = await fetchFaceMedia(media);
         if (face.buffer) {
-          if (totalBytes + face.buffer.length > MAX_MEDIA_BYTES) {
-            parts.push({ type: 'text', text: `[表情${index}（图片总大小超限，已跳过）]` });
-            continue;
-          }
-          totalBytes += face.buffer.length;
           if (face.text) parts.push({ type: 'text', text: face.text });
-          parts.push({ type: 'image', mediaType: face.mimeType || 'image/png', data: face.buffer.toString('base64'), name: `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}` });
+          if (!pushImage(face.mimeType || 'image/png', face.buffer, `face-${media.faceId}.${(face.mimeType || 'png').split('/')[1]}`)) {
+            parts.push({ type: 'text', text: `[表情${index}（图片总大小超限，已跳过）]` });
+          }
         } else {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
+      } else if (mediaIsVideo(media)) {
+        // 视频 → ffmpeg 抽关键帧 → 逐帧当作图片；帧数与图片共用 MAX_MEDIA_COUNT 预算。
+        if (imageCount >= MAX_MEDIA_COUNT) {
+          parts.push({ type: 'text', text: `[视频${index}（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）]` });
+          continue;
+        }
+        const result = await fetchVideoFrames(media);
+        if (!result.frames.length) {
+          parts.push({ type: 'text', text: `[视频${index}（${result.error || '抽帧失败'}）]` });
+          continue;
+        }
+        parts.push({ type: 'text', text: `[视频${index}关键帧 ${result.frames.length} 张${result.duration ? `，时长约 ${Math.round(result.duration)}s` : ''}]` });
+        for (let i = 0; i < result.frames.length; i += 1) {
+          const frame = result.frames[i];
+          if (!pushImage(frame.mimeType || 'image/jpeg', frame.buffer, `qq-video-${index}-${i + 1}.jpg`)) {
+            parts.push({ type: 'text', text: '[视频关键帧（超过单条上限或总大小，后续帧已跳过）]' });
+            break;
+          }
+        }
       } else {
+        if (imageCount >= MAX_MEDIA_COUNT) {
+          parts.push({ type: 'text', text: `[图片/表情 ${index}（超过单条上限 ${MAX_MEDIA_COUNT}，已跳过）]` });
+          continue;
+        }
         const img = await fetchOneBotImage(media);
         const sticker = media.kind === 'sticker';
         const summary = sticker && media.summary ? `:${String(media.summary).slice(0, 20)}` : '';
         const label = sticker ? (summary ? `[表情${summary}]` : `[表情${index}]`) : `[图片${index}]`;
         if (img?.buffer) {
-          if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
-            parts.push({ type: 'text', text: `${label}（图片总大小超限，已跳过）` });
-            continue;
-          }
-          totalBytes += img.buffer.length;
           parts.push({ type: 'text', text: label });
-          parts.push({ type: 'image', mediaType: img.mimeType || 'image/jpeg', data: img.buffer.toString('base64'), name: `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}` });
+          if (!pushImage(img.mimeType || 'image/jpeg', img.buffer, `qq-${sticker ? 'sticker' : 'image'}-${index}.${(img.mimeType || 'image/jpeg').split('/')[1]}`)) {
+            parts.push({ type: 'text', text: `${label}（图片总大小超限，已跳过）` });
+          }
         } else {
           parts.push({ type: 'text', text: `${label}（获取失败）` });
         }
@@ -8537,6 +8886,31 @@ async function main() {
         } else {
           out.push({ index, kind: 'face', faceId: media.faceId ? String(media.faceId) : undefined, text: face.text || `[表情#${media.faceId}]` });
         }
+      } else if (mediaIsVideo(media)) {
+        // 工具按需查看：视频同样抽帧，返回的是「一帧一个条目」，MCP 端会逐张作为图像内容下发。
+        const videoBase = {
+          index,
+          kind: 'video',
+          ...(media.url ? { url: String(media.url) } : {}),
+          ...(media.file ? { file: String(media.file) } : {}),
+          ...(media.summary ? { summary: String(media.summary) } : {})
+        };
+        const result = await fetchVideoFrames(media);
+        if (!result.frames.length) {
+          out.push({ ...videoBase, text: `（视频抽帧失败：${result.error || '未知原因'}）` });
+          continue;
+        }
+        out.push({ ...videoBase, text: `视频关键帧 ${result.frames.length} 张${result.duration ? `，时长约 ${Math.round(result.duration)}s` : ''}` });
+        for (let i = 0; i < result.frames.length; i += 1) {
+          if (out.length >= MAX_MEDIA_COUNT * 2 + 1) break;
+          out.push({
+            index,
+            kind: 'video',
+            mimeType: result.frames[i].mimeType || 'image/jpeg',
+            data: result.frames[i].buffer.toString('base64'),
+            text: `关键帧 ${i + 1}/${result.frames.length}`
+          });
+        }
       } else {
         const img = await fetchOneBotImage(media);
         const kind = media.kind === 'sticker' ? 'sticker' : 'image';
@@ -8572,10 +8946,13 @@ async function main() {
 
   function mediaHintFor(key, messageRef, mediaList) {
     if (!Array.isArray(mediaList) || mediaList.length === 0 || !messageRef) return '';
+    const hasVideo = mediaList.some((m) => mediaIsVideo(m));
+    const noun = hasVideo ? '图片/表情/视频' : '图片/表情';
+    const extra = hasVideo ? '（视频会被自动抽取关键帧识别）' : '';
     if (currentMode === 'reserved2') {
-      return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
+      return `\n【${noun}】本条消息包含 ${mediaList.length} 个媒体${extra}（消息ID=${messageRef}）。如需要查看/识别，请调用 mcp__snowluma__qq_get_message_images，参数 key="${key}", messageId="${messageRef}"。`;
     }
-    return `\n【图片/表情】本条消息包含 ${mediaList.length} 个图片/表情（消息ID=${messageRef}）。`;
+    return `\n【${noun}】本条消息包含 ${mediaList.length} 个媒体${extra}（消息ID=${messageRef}）。`;
   }
 
   function findMessageMedia(key, ref) {
@@ -10586,11 +10963,14 @@ async function main() {
       // 这样 AI 看到「[引用 某人：[转发消息 id=…]]」后能直接用 qq_get_forward_msg 打开（哪怕原转发早已滚出最近消息）。
       const forwardIds = extractForwardIds(raw.message ?? []).map(sanitizeForwardId).filter(Boolean);
       if (forwardIds.length) rememberForwardIds(`${kind}:${String(convId)}`, forwardIds);
+      // 被引用消息自带媒体时一并带出：调用方（引用视频/图片后被 @）据此把媒体挂到当前消息上。
+      const media = extractMediaFromSegments(raw.message ?? []);
       const info = {
         sender: String(sender ?? ''),
         text: String(text ?? '').slice(0, 200),
         userId: senderUserId != null ? String(senderUserId) : null,
-        forwardIds
+        forwardIds,
+        ...(media.length ? { media } : {})
       };
       replyInfoCache.set(cacheKey, { info, ts: Date.now() });
       return info;
@@ -11241,6 +11621,23 @@ async function main() {
     saveSocialV2State();
     const promptText = buildWakePromptV2(key, reason);
     log(`[reserved2] 唤醒 ${key}（${reason}）`);
+    // 唤醒时把未读里最近的媒体内联给模型（图片直接给、视频抽帧后给）：
+    // 上游设计是让模型自己按 mediaHint 调 qq_get_message_images，但实测它经常直接回「看不到」；
+    // 这里内联一份（受 MAX_MEDIA_COUNT 限制，仅在有未读时发生），工具查询作为补充。
+    const wakeMedia = (() => {
+      const unread = Array.isArray(st.unread) ? st.unread : [];
+      const picked = [];
+      for (let i = unread.length - 1; i >= 0 && picked.length < MAX_MEDIA_COUNT; i -= 1) {
+        const m = unread[i];
+        if (!m || m.isSelf) continue;
+        for (const item of Array.isArray(m.media) ? m.media : []) {
+          picked.push(item);
+          if (picked.length >= MAX_MEDIA_COUNT) break;
+        }
+      }
+      return picked;
+    })();
+    if (wakeMedia.length) log(`[reserved2] 内联媒体 ${wakeMedia.length} 个（${key}）`);
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
@@ -11249,7 +11646,7 @@ async function main() {
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
-      const result = await deliverPrompt(key, promptText, { wakeReason: reason });
+      const result = await deliverPrompt(key, promptText, { wakeReason: reason, ...(wakeMedia.length ? { media: wakeMedia } : {}) });
       const restoreFiniteSleep = () => {
         if (hadFiniteSleep) {
           st.wakeConfig.sleepUntil = prevSleepUntil;
@@ -11727,7 +12124,22 @@ async function main() {
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
     const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
     const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
-    const mediaList = extractMediaFromSegments(event.message ?? []);
+    let mediaList = extractMediaFromSegments(event.message ?? []);
+    // 「引用一条视频/图片 + 一句 @我」：当前消息本身没有媒体段，媒体在被引用的那条上。
+    // 把被引用消息的媒体挂到本条消息：这样唤醒时的内联、qq_get_message_images、以及
+    // 之后有人再引用这条消息时都能拿到它，模型不会再只看得到一个 [视频] 文字占位。
+    if (!mediaList.length) {
+      const replySeg = (event.message ?? []).find((s) => s?.type === 'reply' && s?.data?.id != null);
+      if (replySeg) {
+        try {
+          const quoted = await resolveReply(String(replySeg.data.id));
+          if (Array.isArray(quoted?.media) && quoted.media.length) {
+            mediaList = quoted.media;
+            log(`[media] ${key}：引用的消息 ${replySeg.data.id} 带 ${quoted.media.length} 个媒体，已并入本条消息`);
+          }
+        } catch { /* 引用解析失败就按无媒体处理 */ }
+      }
+    }
     const messageRef = String(event.message_id ?? event.msg_id ?? event.message_seq ?? '');
     const seqRef = event.message_seq != null ? String(event.message_seq) : '';
     const refsToStore = [...new Set([messageRef, seqRef].filter(Boolean))];
@@ -12255,6 +12667,23 @@ async function main() {
       log,
     });
     if (!r.handled) return r;
+    if (ev.kind === 'recall') {
+      // 撤回：事件本身不带内容，我们也不去捞（不把被撤回的话写进任何地方）。
+      // 只在消息流里留一行，让 AI 知道「刚那条没了」，接得住「撤回干嘛」这类话。
+      if (currentMode === 'reserved2' && isSessionAllowedInCurrentMode(key)) {
+        let name = groupMemberNameCache.get(`${ev.groupId}:${ev.userId}`)?.name ?? '';
+        if (!name) {
+          try {
+            const info = await fetchMemberInfo(ev.groupId, ev.userId);
+            name = info?.card || info?.nickname || '';
+          } catch {}
+        }
+        const streamText = `[撤回] ${name ? `${name}（QQ ${ev.userId}）` : `QQ ${ev.userId}`} 撤回了一条消息`;
+        appendActivity(`${key} ${streamText}`);
+        appendSocialV2Notice(key, { text: streamText, userId: ev.userId });
+      }
+      return r;
+    }
     if (ev.kind === 'join' || ev.kind === 'leave' || ev.kind === 'card') { groupMemberNameCache.delete(`${ev.groupId}:${ev.userId}`); groupMemberIdsCache.delete(ev.groupId); }
     if (r.streamText) appendActivity(`${key} ${r.streamText}`);
     if (currentMode !== 'reserved2' || !r.streamText || !isSessionAllowedInCurrentMode(key)) return r;
