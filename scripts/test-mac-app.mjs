@@ -29,7 +29,8 @@ test('control-center.command 第一次运行时自动生成 App：只在 App 不
   assert.ok(gen > 0 && start > gen, '先（按需）生成 App，再启动控制中心');
   assert.match(s, /if \[\[ ! -d "\$APP" && -z "\$QQ_BRIDGE_NO_MAC_APP" \]\]; then/, '只在 App 不存在、且没关掉时生成');
   assert.match(s, /APP="QQ Bridge 控制中心\.app"/);
-  assert.match(s, /else\n\s+echo "\[qq-bridge\] 没能生成 App/, '生成失败只提示，不退出');
+  // 仓库在 Windows 上检出时是 CRLF，正则里别只认 \n。
+  assert.match(s, /else\r?\n\s+echo "\[qq-bridge\] 没能生成 App/, '生成失败只提示，不退出');
   assert.ok(!/build-mac-app\.mjs[^\n]*\|\|\s*exit/.test(s), '生成失败不会中断启动');
 });
 

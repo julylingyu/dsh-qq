@@ -159,8 +159,10 @@ console.log('## 共享库符号完整性（防"用了但没 import"）');
     const rel = path.relative(ROOT, entryFile).replace(/\\/g, '/');
     if (!fs.existsSync(entryFile)) continue;
     const src = fs.readFileSync(entryFile, 'utf8');
-    // 独立工具经 ../qq-bridge/src/ 引用共享库，桥接侧经 ./ 或 ../src/，两种都要认
-    const importedBlock = [...src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'[^']*(?:send-voice-lib|voice-core)\.js'/g)]
+    // 独立工具经 ../qq-bridge/src/ 引用共享库，桥接侧经 ./ 或 ../src/，两种都要认。
+    // video-frames 也算：voice-core 与 video-frames 都导出 resolveFfmpeg，桥接现在从后者引；
+    // 只认 send-voice-lib/voice-core 会把「已 import」误判成缺失。
+    const importedBlock = [...src.matchAll(/import\s*\{([^}]*)\}\s*from\s*'[^']*(?:send-voice-lib|voice-core|video-frames)[^']*'/g)]
       .map((m) => m[1]).join(',');
     const missing = symbols.filter((sym) => {
       const used = new RegExp(`(?<![\\w.$])${sym}\\s*[(,)\\[]`).test(src);

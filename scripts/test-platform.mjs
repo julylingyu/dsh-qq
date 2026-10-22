@@ -36,7 +36,8 @@ async function until(fn, ms = 8000, what = '条件') {
 }
 
 test('① 接口平台自身测试全部通过', { skip: SKIP }, () => {
-  const r = spawnSync(process.execPath, ['--test', '--test-timeout=30000', 'test/units.test.mjs', 'test/e2e.test.mjs'], { cwd: PLATFORM_DIR, encoding: 'utf8', timeout: 120_000 });
+  // 显式指定 TAP：Node 22+ 在非 TTY 下可能换成 spec 报告器，就没有 `# fail 0` 这些汇总行了。
+  const r = spawnSync(process.execPath, ['--test', '--test-timeout=30000', '--test-reporter=tap', 'test/units.test.mjs', 'test/e2e.test.mjs'], { cwd: PLATFORM_DIR, encoding: 'utf8', timeout: 120_000 });
   const summary = (r.stdout ?? '').split('\n').filter((l) => /^# (tests|pass|fail)/.test(l)).join(' / ');
   assert.equal(r.status, 0, `${summary}\n${(r.stdout ?? '').split('\n').filter((l) => /^not ok|error:|expected|actual/.test(l)).join('\n')}${r.stderr ?? ''}`);
   assert.match(summary, /# fail 0/);

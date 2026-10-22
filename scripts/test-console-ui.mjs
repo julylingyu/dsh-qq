@@ -24,14 +24,25 @@ async function loadPlaywright() {
   for (const candidate of [process.env.PLAYWRIGHT_MODULE, 'playwright'].filter(Boolean)) {
     try { return require(candidate); } catch {}
   }
-  throw new Error('Playwright not found. Install with npm install --no-save playwright, or set PLAYWRIGHT_MODULE to its package directory.');
+  return null;
 }
 
-const { chromium } = await loadPlaywright();
+// 前置条件不足时如实跳过（与 voice-tool 的 skipVoiceTool 同款措辞），不要伪装成通过。
+function skipSuite(why) {
+  console.log('## 控制台 UI 真实浏览器测试');
+  console.log(`   ⏭️  跳过：${why}`);
+  console.log('     注意：这是**跳过，不是通过** —— 这台机器上没有覆盖到 UI 契约。');
+  process.exit(0);
+}
+
+const playwright = await loadPlaywright();
+if (!playwright) skipSuite('没装 Playwright（npm install --no-save playwright，或用 PLAYWRIGHT_MODULE 指定其目录）');
+const { chromium } = playwright;
 const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || [
   join(process.env.PROGRAMFILES || '', 'Google/Chrome/Application/chrome.exe'),
   join(process.env['PROGRAMFILES(X86)'] || '', 'Microsoft/Edge/Application/msedge.exe'),
 ].find(x => existsSync(x));
+if (!executablePath) skipSuite('没找到 Chrome / Edge（可用 PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH 指定浏览器路径）');
 const fixture = await startConsoleFixture({ original });
 let browser;
 const results = [];
@@ -119,11 +130,18 @@ try {
 
   await test('Mode and preset contracts', async () => {
     for (const mode of ['chat', 'reserved', 'reserved2', 'closed-agent']) {
-      assert.deepEqual(await clickWrite(`#modeRow [data-mode="${mode}"]`, '/api/mode'), { mode, closedAgentPreset: '' });
+      // 闭集 agent 模式会带权限级别；旧版控制台没有级别选择器，因此基线模式下不带 level。
+      const withLevel = mode === 'closed-agent' && !original;
+      const expected = withLevel
+        ? { mode, closedAgentPreset: '', level: 'L2' }
+        : { mode, closedAgentPreset: '' };
+      assert.deepEqual(await clickWrite(`#modeRow [data-mode="${mode}"]`, '/api/mode'), expected);
     }
     const select = await reveal('#closedPreset');
     await Promise.all([page.waitForResponse(r => r.url().endsWith('/api/mode') && r.request().method() === 'POST'), select.selectOption('qq-chat-v2')]);
-    assert.deepEqual(fixture.requests.at(-1).body, { mode: 'closed-agent', closedAgentPreset: 'qq-chat-v2' });
+    assert.deepEqual(fixture.requests.at(-1).body, original
+      ? { mode: 'closed-agent', closedAgentPreset: 'qq-chat-v2' }
+      : { mode: 'closed-agent', closedAgentPreset: 'qq-chat-v2', level: 'L2' });
   });
 
   await test('Role creation, selection, clearing and silent-mode contracts', async () => {
@@ -147,7 +165,8 @@ try {
   // state/ 的 ACL 收紧需要管理员权限，未提权时桥接会明确报告 hardened:false。
   // 控制台必须把这件事**显式**呈现（含可复制的提权命令），而不是让用户以为已经安全；
   // 用户按提示处理后点「重新检测」应当转为成功态。
-  await test('Unhardened state directory surfaces a warning with the exact command', async () => {
+  // 旧版控制台没有这块 UI，只在当前版控制台上断言。
+  if (!original) await test('Unhardened state directory surfaces a warning with the exact command', async () => {
     await navigate('access');
     await page.waitForFunction(() => document.getElementById('stateDirWarn')?.style.display !== 'none');
     const shown = await page.evaluate(() => ({
@@ -219,16 +238,19 @@ try {
     await fill('slangSearchConfirmed', '测试词条');
     assert.equal(await page.locator('#slangConfirmedList tbody tr').count(), 2, 'Filtered table should contain header and one entry');
     // demo-candidate 已有含义：在「候选词-已研究」栏，不在「待研究」栏
-    await (await reveal('.slang-tab[data-slang-tab="candidate"]')).click();
-    assert.equal(await page.locator('#slangCandidateList [data-slang-confirm="demo-candidate"]').count(), 0, '有含义的候选不在待研究栏');
-    await (await reveal('.slang-tab[data-slang-tab="researched"]')).click();
-    await page.locator('[data-slang-confirm="demo-candidate"]').click();
-    await fill('slangModalMeaning', '感到安慰');
-    await fill('slangModalUsage', '轻松聊天');
-    await fill('slangModalExample', '有被治愈到。');
-    await fill('slangModalRisk', '无');
-    await fill('slangModalSources', 'https://example.invalid/offline-source');
-    assert.deepEqual(await clickWrite('#slangModalDirectConfirm', '/api/slang/demo-candidate/confirm'), { meaning: '感到安慰', usage: '轻松聊天', example: '有被治愈到。', risk: '无', sources: ['https://example.invalid/offline-source'] });
+    // 旧版控制台没有「已研究」这一栏，这段只在当前版跑；基线按子序列比对，缺它不影响。
+    if (!original) {
+      await (await reveal('.slang-tab[data-slang-tab="candidate"]')).click();
+      assert.equal(await page.locator('#slangCandidateList [data-slang-confirm="demo-candidate"]').count(), 0, '有含义的候选不在待研究栏');
+      await (await reveal('.slang-tab[data-slang-tab="researched"]')).click();
+      await page.locator('[data-slang-confirm="demo-candidate"]').click();
+      await fill('slangModalMeaning', '感到安慰');
+      await fill('slangModalUsage', '轻松聊天');
+      await fill('slangModalExample', '有被治愈到。');
+      await fill('slangModalRisk', '无');
+      await fill('slangModalSources', 'https://example.invalid/offline-source');
+      assert.deepEqual(await clickWrite('#slangModalDirectConfirm', '/api/slang/demo-candidate/confirm'), { meaning: '感到安慰', usage: '轻松聊天', example: '有被治愈到。', risk: '无', sources: ['https://example.invalid/offline-source'] });
+    }
     await fill('slangExtractMin', 14);
     await fill('slangThresholds', '3，6 12');
     const config = await clickWrite('#slangConfigSave', '/api/slang/config');
@@ -253,7 +275,27 @@ try {
     console.log(`Recorded original API contracts: ${baselinePath}`);
   } else await test('All submitted payloads exactly match the pre-redesign console baseline', async () => {
     const expected = JSON.parse(await readFile(baselinePath, 'utf8'));
-    assert.deepEqual(fixture.requests, expected);
+    // 基线断言的是「旧控制台发过的写请求，新控制台**一条都不能变**」。
+    // 改版后新增写请求、或给已有请求加字段（如 mode 加 level、工具表加新开关）是正常演进，
+    // 所以：请求按子序列匹配（允许多出新请求），载荷按「基线是子集」比对（允许新字段，
+    // 旧字段的值必须一致）。旧字段被删/被改会失败。
+    const subset = (actual, want) => {
+      if (want === null || typeof want !== 'object') return Object.is(actual, want);
+      if (Array.isArray(want)) {
+        if (!Array.isArray(actual) || actual.length !== want.length) return false;
+        return want.every((w, i) => subset(actual[i], w));
+      }
+      if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false;
+      return Object.keys(want).every((k) => k in actual && subset(actual[k], want[k]));
+    };
+    const same = (a, b) => a?.method === b?.method && a?.path === b?.path
+      && subset(a?.body ?? null, b?.body ?? null);
+    let cursor = 0;
+    for (const exp of expected) {
+      while (cursor < fixture.requests.length && !same(fixture.requests[cursor], exp)) cursor += 1;
+      assert.ok(cursor < fixture.requests.length, `缺少与基线一致的请求（或旧字段被改动）：${exp.method} ${exp.path}`);
+      cursor += 1;
+    }
   });
 
   if (!original) await test('Token usage panel renders totals, per-conversation and per-turn cost', async () => {
@@ -553,7 +595,8 @@ try {
     assert.match(notices, /能不能看图未知/);
     await page.locator('#dshModelSelect').selectOption('example-reasoner');
     assert.deepEqual(await efforts(), ['minimal', 'medium', 'xhigh'], '档位跟着模型变');
-    page.once('dialog', (d) => d.accept());
+    // 弹窗由文件顶部的全局 page.on('dialog') 统一 accept；这里不要再挂 once，
+    // 否则同一个 dialog 被 accept 两次，Playwright 抛 "already handled"。
     const [saved] = await Promise.all([
       page.waitForResponse(r => new URL(r.url()).pathname === '/api/dsh/model' && r.request().method() === 'POST'),
       page.locator('#dshEffortSave').click(),

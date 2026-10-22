@@ -345,8 +345,11 @@ test('控制中心：选择缺数据的新目录时先不切换、返回迁移�
   const d = tmp();
   fs.writeFileSync(path.join(d, 'package.json'), JSON.stringify({ version: '9.9.9-test' }));
   fs.mkdirSync(path.join(d, 'node_modules'));
-  const old = fakeSnowLuma(path.join(d, 'sl-old'), '1.14.22', { files: { 'config/onebot_10001.json': '{}', 'config/webui.json': '{"passwordHash":"fake"}' } });
-  const fresh = fakeSnowLuma(path.join(d, 'sl-new'), '2.0.3');
+  // webuiPort 固定到 1（不可能有服务监听）：lite 版默认 5099，而本机可能真有一台 SnowLuma
+  // 跑在 5099 上，迁移守卫会误判「SnowLuma 正在运行」而 409。测试不能依赖宿主机状态。
+  const closedPort = { 'config/runtime.json': JSON.stringify({ webuiPort: 1 }) };
+  const old = fakeSnowLuma(path.join(d, 'sl-old'), '1.14.22', { files: { 'config/onebot_10001.json': '{}', 'config/webui.json': '{"passwordHash":"fake"}', ...closedPort } });
+  const fresh = fakeSnowLuma(path.join(d, 'sl-new'), '2.0.3', { files: { ...closedPort } });
   fs.mkdirSync(path.join(d, 'state'), { recursive: true });
   fs.writeFileSync(path.join(d, 'state', 'control-center.json'), JSON.stringify({ snowlumaDir: old }));
   const cc = await startControlCenter({ open: false, port: 0, root: d, bridgeEntry: path.join(d, 'nope.mjs'), installSignalHandlers: false, exitOnShutdown: false, log: () => {} });
@@ -363,7 +366,7 @@ test('控制中心：选择缺数据的新目录时先不切换、返回迁移�
     assert.equal(mig.body.ok, true, JSON.stringify(mig.body));
     assert.equal(fs.readFileSync(path.join(fresh, 'config', 'webui.json'), 'utf8'), '{"passwordHash":"fake"}', '迁移把 WebUI 密码一起带过去');
     assert.equal(path.resolve(saved()), path.resolve(fresh), '迁移后切到新目录');
-    const another = fakeSnowLuma(path.join(d, 'sl-another'), '2.0.3');
+    const another = fakeSnowLuma(path.join(d, 'sl-another'), '2.0.3', { files: { ...closedPort } });
     const r2 = await req(cc.port, 'POST', '/api/snowluma/select', { body: { dir: another }, headers: T });
     assert.equal(r2.body.needMigrate, true);
     const r3 = await req(cc.port, 'POST', '/api/snowluma/select', { body: { dir: another, force: true }, headers: T });
