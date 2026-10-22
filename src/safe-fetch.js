@@ -360,8 +360,8 @@ export function looksLikeImageBuffer(buf) {
   return false;
 }
 
-/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
-export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+/** 抓取字节（带 SSRF 防护）。requireImage=true 时要求内容是图片签名。 */
+async function fetchBufferInternal(urlString, maxBytes, { requireImage }) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
@@ -374,12 +374,25 @@ export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
       continue;
     }
     if (result.statusCode < 200 || result.statusCode >= 300) {
-      throw new Error(`图片抓取失败：HTTP ${result.statusCode}`);
+      throw new Error(`${requireImage ? '图片抓取失败' : '抓取失败'}：HTTP ${result.statusCode}`);
     }
-    if (!looksLikeImageBuffer(result.buffer)) {
+    if (requireImage && !looksLikeImageBuffer(result.buffer)) {
       throw new Error(`抓取内容不是有效图片（PNG/JPEG/GIF/WebP）`);
     }
     return { url: url.toString(), statusCode: result.statusCode, buffer: result.buffer };
   }
   throw new Error('重定向次数过多，已停止');
+}
+
+/** 抓取图片字节并返回 Buffer（带 SSRF 防护，且校验确实为图片）。 */
+export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
+  return fetchBufferInternal(urlString, maxBytes, { requireImage: true });
+}
+
+/**
+ * 抓取任意二进制（视频等）并返回 Buffer：保留同样的 SSRF、跳转与大小防护，
+ * 但**不**校验图片签名 —— QQ 短视频的 CDN 地址本质是 mp4，交给 ffmpeg 处理。
+ */
+export async function safeFetchBinary(urlString, maxBytes = 50 * 1024 * 1024) {
+  return fetchBufferInternal(urlString, maxBytes, { requireImage: false });
 }

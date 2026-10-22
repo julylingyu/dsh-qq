@@ -218,13 +218,14 @@ export function selectionNotices({ provider, model, reasoningEffort, vision, pri
   return notices;
 }
 
-/** 不能看图时，聊天消息里的图片 / 表情改成文字占位（不去下载图片）。 */
+/** 不能看图时，聊天消息里的图片 / 表情 / 视频改成文字占位（不去下载图片，也不抽帧）。 */
 export function mediaTextParts(mediaList, modelLabel = '') {
   const list = Array.isArray(mediaList) ? mediaList : [];
   const who = modelLabel ? `当前模型 ${modelLabel}` : '当前模型';
   return list.filter((m) => m && typeof m === 'object').map((media, i) => {
     const index = i + 1;
     if (media.kind === 'face') return { type: 'text', text: `[表情#${clean(media.faceId) || index}]` };
+    if (media.kind === 'video') return { type: 'text', text: `[视频${index}：${who}不能看图，已省略]` };
     const sticker = media.kind === 'sticker';
     const summary = sticker && media.summary ? `:${String(media.summary).slice(0, 20)}` : '';
     const label = sticker ? (summary ? `表情${summary}` : `表情${index}`) : `图片${index}`;
@@ -238,7 +239,7 @@ export function mediaTextEntries(mediaList, modelLabel = '') {
   const who = modelLabel ? `当前模型 ${modelLabel}` : '当前模型';
   return list.filter((m) => m && typeof m === 'object').map((media, i) => ({
     index: i + 1,
-    kind: media.kind === 'face' ? 'face' : (media.kind === 'sticker' ? 'sticker' : 'image'),
+    kind: media.kind === 'face' ? 'face' : (media.kind === 'sticker' ? 'sticker' : (media.kind === 'video' ? 'video' : 'image')),
     text: `（${who}不能看图，已省略）`,
   }));
 }
