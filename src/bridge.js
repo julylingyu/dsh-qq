@@ -2486,6 +2486,8 @@ async function main() {
 
   function maybeQueueSlangExtraction(key) {
     if (cfg.slang?.enabled === false) return;
+    // 控制台暂停二代 AI 时也要停掉黑话抽取：它同样会开 DSH 会话烧 token。
+    if (socialV2.paused) return;
     if (!dshReady) return;
     const cooldown = Number(cfg.slang?.extractCooldownMs ?? 300000);
     const last = slangExtractionCooldowns.get(key) ?? 0;
