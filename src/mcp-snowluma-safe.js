@@ -1734,10 +1734,13 @@ if (getConfig().socialV2?.tools?.bili !== false) {
       action: z.enum(['view', 'peek', 'comments', 'danmaku', 'search', 'hot', 'sub']).describe('要做的事'),
       input: z.string().optional().describe('BV 号/链接（search 时填关键词；hot 可省略）'),
       limit: z.number().min(1).max(30).optional().describe('search/hot 的条数'),
+      format: z.enum(['text', 'srt', 'md', 'json', 'txt']).optional().describe('sub 专用：srt/md 带时间戳（md 可跳回原片），会落盘并返回路径'),
     },
-    async ({ action, input, limit }) => {
-      const r = await runBiliWatch(action, input, { limit, cfg: getConfig() });
-      return { content: [{ type: 'text', text: r.ok ? r.text : `bili-watch 失败：${r.error}` }], isError: r.ok === false };
+    async ({ action, input, limit, format }) => {
+      const r = await runBiliWatch(action, input, { limit, format, cfg: getConfig() });
+      if (!r.ok) return { content: [{ type: 'text', text: `bili-watch 失败：${r.error}` }], isError: true };
+      const text = r.path ? `${r.text}\n\n[已保存] ${r.path}（${r.savedChars} 字节）` : r.text;
+      return { content: [{ type: 'text', text }] };
     }
   );
 }

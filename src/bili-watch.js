@@ -53,10 +53,11 @@ function run(args, { dir, timeoutMs }) {
  * @param {'view'|'peek'|'comments'|'danmaku'|'search'|'hot'|'sub'} action
  * @param {string} target  BV 号/链接（search 时是关键词，hot 时忽略）
  */
-export async function runBiliWatch(action, target, { limit, cfg = {}, log = () => {} } = {}) {
+export async function runBiliWatch(action, target, { limit, format, outDir, cfg = {}, log = () => {} } = {}) {
   const c = resolveBiliWatchConfig(cfg);
   if (!c.enabled) return { ok: false, error: 'bili 的 CLI 已关闭（socialV2.bili.cliEnabled=false）' };
   const args = [action];
+  let outFile = '';
   if (action === 'hot') {
     if (limit) args.push('--limit', String(limit));
   } else if (action === 'search') {
@@ -70,10 +71,31 @@ export async function runBiliWatch(action, target, { limit, cfg = {}, log = () =
   } else {
     if (!target) return { ok: false, error: `${action} 需要 BV 号或链接` };
     args.push(String(target));
+    // 字幕：srt/md 带时间戳与跳转链接，直接落盘再回一段开头，避免把整篇塞进上下文。
+    if (action === 'sub' && format) {
+      const fmt = String(format).toLowerCase();
+      if (!['text', 'srt', 'md', 'json', 'txt'].includes(fmt)) return { ok: false, error: `不支持的 format：${format}` };
+      const dir = path.resolve(outDir || path.join(c.dir, 'subs'));
+      fs.mkdirSync(dir, { recursive: true });
+      const safe = String(target).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40) || 'sub';
+      outFile = path.join(dir, `${safe}-${Date.now()}.${fmt === 'text' ? 'txt' : fmt}`);
+      args.push('--format', fmt, '--out', outFile);
+    }
   }
   try {
     const text = await run(args, c);
-    return { ok: true, action, text: text.slice(0, c.maxChars), chars: Math.min(text.length, c.maxChars), truncated: text.length > c.maxChars };
+    // --out 模式下 CLI 不往 stdout 打正文，直接从落盘文件取开头做预览。
+    let preview = text;
+    if (outFile && fs.existsSync(outFile)) {
+      preview = fs.readFileSync(outFile, 'utf8').slice(0, c.maxChars);
+    }
+    const head = preview.slice(0, c.maxChars);
+    const result = { ok: true, action, text: head, chars: head.length, truncated: preview.length > c.maxChars };
+    if (outFile) {
+      result.path = outFile;
+      result.savedChars = fs.existsSync(outFile) ? fs.statSync(outFile).size : 0;
+    }
+    return result;
   } catch (error) {
     log(`[bili] ${action} 失败：${error?.message ?? error}`);
     return { ok: false, action, error: String(error?.message ?? error) };
