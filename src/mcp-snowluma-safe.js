@@ -1704,32 +1704,27 @@ if (getConfig().socialV2?.tools?.hearing !== false) {
 }
 
 if (getConfig().socialV2?.tools?.bili !== false) {
-  server.tool(
-    'qq_bili_video',
-    '读一个 B站 视频的信息：标题、UP、时长、简介、热门评论；可选热弹幕。B站 链接、BV 号、av 号都行。字幕需要配置 SESSDATA，没有就先用简介+评论+弹幕判断内容。',
-    {
-      input: z.string().describe('视频链接或 BV 号'),
-      danmaku: z.number().min(0).max(50).optional().describe('顺便取多少条热弹幕，默认 0'),
-    },
-    async ({ input, danmaku }) => {
-      try {
-        const c = getConfig();
-        const info = await fetchVideoInfo(input, { sessdata: c.socialV2?.bili?.sessdata ?? '' });
-        if (info.ok && danmaku > 0) {
-          try { info.danmaku = await fetchDanmaku(info.cid, { limit: danmaku }); } catch (e) { info.danmaku = { ok: false, error: String(e?.message ?? e) }; }
-        }
-        return { content: [{ type: 'text', text: serializeModelData(info) }], isError: info.ok === false };
-      } catch (error) {
-        return { content: [{ type: 'text', text: `读 B站 视频失败：${error?.message ?? error}` }], isError: true };
-      }
+  /**
+   * CLI 不可用时的接口兜底：只有 view / comments / danmaku 有等价实现。
+   * （peek 抽帧、hot 热榜、search 搜索、sub 字幕都依赖 CLI，无法兜底。）
+   */
+  async function biliApiFallback(action, input, limit) {
+    const c = getConfig();
+    const sessdata = c.socialV2?.bili?.sessdata ?? '';
+    const info = await fetchVideoInfo(input, { sessdata, maxComments: limit ? Math.min(20, limit * 3) : 8 });
+    if (!info.ok) return { ok: false, error: info.error };
+    if (action === 'danmaku') {
+      const d = await fetchDanmaku(info.cid, { limit: limit || 30 });
+      return { ok: true, text: `[兜底·接口] ${info.title}（${d.count} 条热弹幕）\n${d.items.join('\n')}` };
     }
-  );
+    return { ok: true, text: `[兜底·接口] ${serializeModelData(info)}` };
+  }
 
-  // dsh-bili-watch 的 CLI 版（不在 profile 里，避免 dsh-tools 双实例把宿主工具链搞断）。
-  // 比 qq_bili_video 多：热榜、搜索、评论区、弹幕热区、多 P、字幕（要扫码登录）。
+  // 只有一个 B站 工具：CLI 优先（热榜/搜索/字幕/抽帧都在它那儿），
+  // CLI 不可用时对 view/comments/danmaku 退回接口实现，避免模型在两种工具间乱选。
   server.tool(
     'qq_bili_watch',
-    '用 bili-watch 命令行读 B站：view 看元数据+热评 / peek 看标题+5帧 / comments 评论区 / danmaku 弹幕热区 / search 搜视频 / hot 热门榜 / sub 字幕（需先扫码登录）。返回的是命令原文。',
+    '读 B站：view 元数据+热评 / peek 标题+5帧 / comments 评论区 / danmaku 弹幕热区 / search 搜视频 / hot 热门榜 / sub 字幕（需先扫码登录，format=md 带时间戳）。CLI 不可用时 view/comments/danmaku 自动退回接口实现。',
     {
       action: z.enum(['view', 'peek', 'comments', 'danmaku', 'search', 'hot', 'sub']).describe('要做的事'),
       input: z.string().optional().describe('BV 号/链接（search 时填关键词；hot 可省略）'),
@@ -1738,9 +1733,15 @@ if (getConfig().socialV2?.tools?.bili !== false) {
     },
     async ({ action, input, limit, format }) => {
       const r = await runBiliWatch(action, input, { limit, format, cfg: getConfig() });
-      if (!r.ok) return { content: [{ type: 'text', text: `bili-watch 失败：${r.error}` }], isError: true };
-      const text = r.path ? `${r.text}\n\n[已保存] ${r.path}（${r.savedChars} 字节）` : r.text;
-      return { content: [{ type: 'text', text }] };
+      if (r.ok) {
+        const text = r.path ? `${r.text}\n\n[已保存] ${r.path}（${r.savedChars} 字节）` : r.text;
+        return { content: [{ type: 'text', text }] };
+      }
+      try {
+        const fb = await biliApiFallback(action, input, limit);
+        if (fb?.ok) return { content: [{ type: 'text', text: `${fb.text}\n\n[CLI 不可用，已退回接口] ${r.error}` }] };
+      } catch { /* 兜底也失败就走下面的报错 */ }
+      return { content: [{ type: 'text', text: `bili-watch 失败：${r.error}` }], isError: true };
     }
   );
 }
