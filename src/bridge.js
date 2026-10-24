@@ -1346,6 +1346,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
 // 「耳朵」的同步缓存：定时器刷新，唤醒提示词只读这里，避免在唤醒路径上等网络。
 let lastMusic = null;
+// 未授权会话的日志节流：同一群/私聊在窗口期内只打一行，其余累计计数。
+// 目的不是隐藏，而是别让一个陌生群刷满 bridge.log（每次消息一行会淹掉真正的错误）。
+const untrustedLogState = new Map();
+const UNTRUSTED_LOG_DEFAULT_MS = 600000;
 const SEND_TIMEOUT_MS = 15000;
 // DSH 控制类调用（停任务/归档会话）的超时。这些 await 以前是裸的：DSH 接受了连接但
 // 不返回响应时，HTTP handler 永不返回，控制台与群消息一起失去响应（issue #32）。
@@ -12150,7 +12154,21 @@ async function main() {
       if (currentLevel !== 'L0') ext.controller.touch();
     }
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
-      log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
+      // 节流：窗口内每个会话只记一行，累计触发次数附在后面。
+      const throttleMs = Math.max(0, Number(cfg.socialV2?.untrustedLogThrottleMs ?? UNTRUSTED_LOG_DEFAULT_MS));
+      const prev = untrustedLogState.get(key) ?? { at: 0, count: 0 };
+      const now = Date.now();
+      prev.count += 1;
+      if (!throttleMs || now - prev.at >= throttleMs) {
+        const extra = prev.count > 1 ? `，窗口内共 ${prev.count} 条` : '';
+        log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}${extra}）`);
+        untrustedLogState.set(key, { at: now, count: 0 });
+        if (untrustedLogState.size > 200) {
+          for (const [k, v] of untrustedLogState) if (now - v.at > throttleMs) untrustedLogState.delete(k);
+        }
+      } else {
+        untrustedLogState.set(key, prev);
+      }
       return;
     }
     const resolveAtName = async (qq) => {
