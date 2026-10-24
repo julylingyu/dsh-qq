@@ -1158,6 +1158,8 @@ function loadState() {
   if (loaded && loaded.sessions && typeof loaded.sessions === 'object') state = loaded;
   else state = { sessions: {} };
   if (!state.sessionPolicies || typeof state.sessionPolicies !== 'object' || Array.isArray(state.sessionPolicies)) state.sessionPolicies = {};
+  // 每个 DSH 会话的创建时间：每日归档用（跨天后的第一次唤醒换新会话，避免历史无限累积）
+  if (!state.sessionStartedAt || typeof state.sessionStartedAt !== 'object' || Array.isArray(state.sessionStartedAt)) state.sessionStartedAt = {};
   // 模式切换期间休眠的聊天会话（见 src/mode-handover.js）；脏数据丢弃
   state.dormantSessions = normalizeDormant(state.dormantSessions);
 }
@@ -3168,6 +3170,37 @@ async function main() {
     markReadCalledKeys.delete(key);
   }
 
+  /**
+   * 每日会话归档：同一个 QQ 会话的 DSH session 跨天就不再复用。
+   *
+   * 为什么要做：桥接给每个会话 key 固定一个 DSH 会话，而 DSH 每一步都要重发该会话的
+   * 全部历史——聊得越久每轮越贵（实测某个群平均 13.8 万 input/轮）。跨天换新会话后，
+   * 新会话只带角色卡 + 本轮快照，历史从零开始；旧会话走 retireSession 正常归档。
+   * 开关：配置 `sessionDailyReset: false` 可关掉。
+   */
+  function sameLocalDay(a, b) {
+    const da = new Date(a);
+    const db = new Date(b);
+    return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
+  }
+
+  function maybeArchiveSessionDaily(key) {
+    if (cfg.sessionDailyReset === false) return false;
+    const sid = state.sessions[key];
+    if (!sid) return false;
+    const startedAt = Number(state.sessionStartedAt?.[key]) || 0;
+    if (!startedAt) {
+      // 升级前建的会话没有时间戳：从现在起算，避免一上线就把所有会话全换掉
+      state.sessionStartedAt[key] = Date.now();
+      saveState();
+      return false;
+    }
+    if (sameLocalDay(startedAt, Date.now())) return false;
+    log(`[daily] 会话 ${key} 建于 ${new Date(startedAt).toLocaleString('zh-CN')}，跨天归档并换新会话`);
+    retireSession(key);
+    return true;
+  }
+
   function retireSession(key, { hibernate = false } = {}) {
     const sessionId = state.sessions[key];
     // 休眠：只对从没挂过本地工具的聊天会话（非 closed-agent 建的）。高权限会话永远走归档。
@@ -3178,6 +3211,7 @@ async function main() {
     }
     delete state.sessions[key];
     delete state.sessionPolicies[key];
+    if (state.sessionStartedAt) delete state.sessionStartedAt[key];
     // 按 key 记账的内存态在**有映射和无映射时都要清**：一条被移出白名单、
     // 但从未成功建过会话的 key 同样会留下限流时间戳与失败标记。
     forgetConversationCaches(key);
@@ -9141,6 +9175,7 @@ async function main() {
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
+    maybeArchiveSessionDaily(key);
     const existing = state.sessions[key];
     if (existing) {
       // reset/清空工作区期间旧映射可能尚未清理；发现代际不匹配必须丢弃旧会话，防止复活。
@@ -9174,6 +9209,7 @@ async function main() {
           delete state.dormantSessions[key];
           state.sessions[key] = sid;
           state.sessionPolicies[key] = policy;
+          if (state.sessionStartedAt) state.sessionStartedAt[key] = Date.now();
           reverse.set(sid, key);
           saveState();
           api.events.follow(sid);
@@ -9276,6 +9312,7 @@ async function main() {
       }
       state.sessions[key] = sessionId;
       state.sessionPolicies[key] = policy;
+      if (state.sessionStartedAt) state.sessionStartedAt[key] = Date.now();
       reverse.set(sessionId, key);
       saveState();
       await ensureChatModel(sessionId);
