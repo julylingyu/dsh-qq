@@ -19,6 +19,7 @@ import { z } from 'zod';
 // 在 MCP 里拦会连「安全拒绝理由」都拿不到，反而让模型无法把话说清楚。
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
+import { resolveDiaryDir, writeDiary, readRecentDiary, hasWrittenToday } from './diary.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -150,22 +151,86 @@ function errorText(value, fallback) {
   return fallback;
 }
 
+// ── 防风控：发送熔断 + 打字状态节流 ─────────────────────────────────────────
+// 教程第十三章的两个真实教训：
+//   ① 发送失败后无脑重试（每 15 秒一次）在腾讯眼里就是机器人 → 连续 3 次失败就停发 3 分钟；
+//   ② 每句都上报"正在输入"太假 → 按概率 + 最小间隔节流（默认 35%、45 秒、至少 20 字才报）。
+const SEND_PATH_RE = /^\/api\/socialV2\/(?:send(?:-|$)|reply|tools\/send)/;
+const breaker = { fails: 0, openUntil: 0 };
+const typingState = new Map();
+
+function isSendPath(p) {
+  return SEND_PATH_RE.test(String(p ?? ''));
+}
+
+function breakerAllow() {
+  return Date.now() >= breaker.openUntil;
+}
+
+function breakerFail() {
+  breaker.fails += 1;
+  if (breaker.fails >= 3) {
+    breaker.openUntil = Date.now() + 180000;
+    breaker.fails = 0;
+    console.error('[breaker] 连续发送失败，熔断 180 秒：期间不再向 QQ 发送，避免重试风暴触发风控');
+  }
+}
+
+function breakerOk() {
+  breaker.fails = 0;
+}
+
+/** 上报"正在输入"（概率 + 最小间隔节流；失败静默）。 */
+function notifyTyping(path, init) {
+  const cfgNow = getConfig();
+  const t = cfgNow.socialV2?.typing ?? {};
+  if (t.enabled === false) return;
+  let body = null;
+  try { body = init?.body ? JSON.parse(String(init.body)) : null; } catch { return; }
+  if (!body?.key) return;
+  const text = String(body.message ?? body.text ?? (Array.isArray(body.messages) ? body.messages.join('') : '')).trim();
+  if (text.length < (Number(t.minCharsForTyping) || 20)) return;
+  if (Math.random() > (Number(t.probability) ?? 0.35)) return;
+  const last = typingState.get(body.key) || 0;
+  if (Date.now() - last < (Number(t.minIntervalMs) || 45000)) return;
+  typingState.set(body.key, Date.now());
+  const m = /^(group|private):(\d+)$/.exec(String(body.key));
+  if (!m) return;
+  const snow = cfgNow.snowluma ?? {};
+  const base = String(snow.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+  const payload = m[1] === 'group' ? { group_id: Number(m[2]), event_type: 1 } : { user_id: Number(m[2]), event_type: 1 };
+  fetch(`${base}/set_input_status`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(snow.accessToken ? { authorization: `Bearer ${snow.accessToken}` } : {}) },
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
 async function agentApi(path, init = {}) {
   const timeoutMs = init.timeoutMs || 15000;
   const { timeoutMs: _omit, ...rest } = init;
   const headers = agentHeaders(rest.headers);
+  const send = isSendPath(path);
+  if (send) {
+    if (!breakerAllow()) throw new Error('发送熔断中（连续发送失败后冷却 180 秒），先别重试，稍后再发');
+    notifyTyping(path, rest);
+  }
   const res = await fetch(`${agentApiBase()}${path}`, { ...rest, headers, signal: AbortSignal.timeout(timeoutMs) });
   let body = null;
   try { body = await res.json(); } catch { body = null; }
   if (!res.ok) {
+    if (send) breakerFail();
     throw new Error(errorText(body?.error, `桥接 API HTTP ${res.status}`));
   }
   // 桥接的部分端点会用 200 + {ok:false,error} 表达业务失败（例如发送被审计拦截）。
   // 不检查 body.ok 会把「被拦截」当成「发送成功」上报给模型 —— 模型据此认为消息已发出，
   // 于是不再重试也不告诉用户，是典型的静默错误。
   if (body && typeof body === 'object' && body.ok === false) {
+    if (send) breakerFail();
     throw new Error(errorText(body.error, '桥接 API 返回 ok:false（未说明原因）'));
   }
+  if (send) breakerOk();
   return body;
 }
 
@@ -1565,6 +1630,49 @@ if (cfg.socialV2?.tools?.ownerGroupAccess === true) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `群规则操作失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (getConfig().socialV2?.tools?.diary !== false) {
+  const diaryDir = () => resolveDiaryDir({ root: ROOT, configured: getConfig().socialV2?.diary?.dir });
+
+  server.tool(
+    'qq_write_diary',
+    '写今天的日记（追加到当天文件，一天可以写多条）。写你自己的事：今天干了什么、谁说了什么让你记住、心情怎么样。不要写成客服周报——具体的小事 + 真实反应才是日记。',
+    {
+      text: z.string().describe('日记正文（第一人称，具体一点）'),
+      title: z.string().optional().describe('这一条的小标题（可选）'),
+      mood: z.string().optional().describe('心情，一两个词（可选）'),
+      tags: z.array(z.string()).optional().describe('标签（可选）'),
+    },
+    async ({ text, title, mood, tags }) => {
+      try {
+        const r = writeDiary(diaryDir(), { text, title, mood, tags });
+        return { content: [{ type: 'text', text: serializeModelData(r) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `写日记失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_read_diary',
+    '读自己写过的日记（最近 N 天，默认 3 天，每天只给当天最后一条）。用来接上之前的心情和事情；今天还没写的话会顺带提醒你。',
+    { days: z.number().int().positive().max(30).optional().describe('读最近几天，默认 3') },
+    async ({ days }) => {
+      try {
+        const dir = diaryDir();
+        const entries = readRecentDiary(dir, days ?? 3, { maxCharsPerEntry: 1200 });
+        return {
+          content: [{
+            type: 'text',
+            text: serializeModelData({ count: entries.length, entries, wroteToday: hasWrittenToday(dir), hint: entries.length ? undefined : '还没有日记。今天想写就写一条。' }),
+          }],
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读日记失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

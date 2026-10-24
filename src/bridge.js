@@ -29,6 +29,9 @@ import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } fro
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { describeCardSegment } from './card-text.js';
+import { resolveDiaryDir, buildDiaryContext } from './diary.js';
+import { readNowPlaying, buildMusicContext, resolveEarsConfig } from './ncm.js';
+import { transcribeRecord } from './voice-asr.js';
 import { normalizeImageRoots, isPathInsideRoots, describeImageRoots } from './image-path.js';
 import {
   createSlowFetchCache,
@@ -1341,6 +1344,8 @@ function log(...args) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
+// 「耳朵」的同步缓存：定时器刷新，唤醒提示词只读这里，避免在唤醒路径上等网络。
+let lastMusic = null;
 const SEND_TIMEOUT_MS = 15000;
 // DSH 控制类调用（停任务/归档会话）的超时。这些 await 以前是裸的：DSH 接受了连接但
 // 不返回响应时，HTTP handler 永不返回，控制台与群消息一起失去响应（issue #32）。
@@ -11541,7 +11546,13 @@ async function main() {
     const identityLine = selfIdentityTextV2();
     const initialPromptText = reason === 'bootstrap' ? formatInitialPromptV2(key) : '';
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + preSleepLine;
+    // 日记：注入她自己写过的最近几篇（默认 3），让她记住自己写过什么；没有就空串。
+    const diaryCfg = cfg.socialV2?.diary ?? {};
+    const diaryText = diaryCfg.inject === false ? '' : buildDiaryContext(resolveDiaryDir({ root: ROOT, configured: diaryCfg.dir }), Number(diaryCfg.injectCount) || 3);
+    const diaryLine = diaryText ? `${diaryText}\n\n` : '';
+    // 耳朵：定时器刷新的同步缓存，没在播就是空串。
+    const musicLine = buildMusicContext(lastMusic);
+    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -12161,8 +12172,32 @@ async function main() {
     };
     // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
     // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-    const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
-    const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    let textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
+    let plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
+    // 语音转写：record 段 → 两步 get_record 拿 wav → 本地 faster-whisper 出文字。
+    // 任何一步失败都保持 [语音] 占位，不影响消息主流程。
+    const recordSeg = (event.message ?? []).find((s) => s?.type === 'record' && s?.data?.file);
+    if (recordSeg && cfg.socialV2?.voice?.asr?.enabled !== false) {
+      try {
+        const asrText = await transcribeRecord({
+          call: (action, params) => {
+            const fn = typeof bot.raw === 'function' ? bot.raw.bind(bot) : bot.request.bind(bot);
+            return fn(action, params);
+          },
+          file: recordSeg.data.file,
+          asr: cfg.socialV2?.voice?.asr ?? {},
+          script: path.join(ROOT, 'scripts', 'transcribe.py'),
+          log,
+        });
+        if (asrText) {
+          const withText = (s) => String(s).replace('[语音]', `[语音] 说的是：「${asrText}」`);
+          textContent = withText(textContent);
+          plainContent = withText(plainContent);
+        }
+      } catch (error) {
+        log(`[asr] 处理语音失败：${error?.message ?? error}`);
+      }
+    }
     let mediaList = extractMediaFromSegments(event.message ?? []);
     // 「引用一条视频/图片 + 一句 @我」：当前消息本身没有媒体段，媒体在被引用的那条上。
     // 把被引用消息的媒体挂到本条消息：这样唤醒时的内联、qq_get_message_images、以及
@@ -13557,6 +13592,16 @@ async function main() {
     log(`SnowLuma 首次连接未成功（将在后台自动重连并尝试自愈 WS token）: ${error?.message ?? error}`);
   });
   log('桥接已启动。按 Ctrl+C 退出。');
+  // 「耳朵」：每 15 秒读一次网易云当前播放（没开 CDP / 没在播都只是返回 null），
+  // 唤醒提示词里用同步缓存拼一行，不在唤醒路径上做网络请求。
+  if (resolveEarsConfig(cfg).enabled) {
+    const pollMusic = () => {
+      readNowPlaying(cfg).then((v) => { lastMusic = v; }).catch(() => {});
+    };
+    pollMusic();
+    const musicTimer = setInterval(pollMusic, 15000);
+    if (typeof musicTimer.unref === 'function') musicTimer.unref();
+  }
   // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
   if (cfg.socialV2?.sticker?.enabled !== false) {
     syncStickerLibrary(true).catch((error) => log('启动预热表情库失败:', error?.message ?? error));
