@@ -168,6 +168,19 @@ const SAFE_PREFIXES = [
   'mcp__web-search-safe__',
 ]
 
+/**
+ * 挂在 `mcp__snowluma__` 下、但**只属于桌面侧**的工具：前缀白名单会把它们一起放行，
+ * 所以必须单独拦。2026-10-25 加了这个名单，起因是桥接后来新增了
+ *   - qq_hear_audio：录本机系统声音并转写（等于给群友一个麦克风）
+ *   - qq_bili_watch：用本机 B站 登录态抓字幕/抽帧（等于借出账号态）
+ * 两者都不该出现在仿真会话里。以后凡是给桌面新增的 MCP 工具，记得加到这里，
+ * 或者干脆放到别的命名空间（如 mcp__desk__）里，别混进 QQ 的白名单前缀。
+ */
+export const QQ_DENY_EXACT = Object.freeze([
+  'qq_hear_audio',
+  'qq_bili_watch',
+])
+
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
 const SAFE_EXACT = new Set([
@@ -210,9 +223,13 @@ export function apply(ctx, config = {}) {
     for (const name of OPERATOR_DENY_TOOLS) {
       try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
     }
+    for (const name of QQ_DENY_EXACT) {
+      try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
+    }
     ctx.tools.guard((exec) => {
       const name = exec?.name
       if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
+      if (QQ_DENY_EXACT.includes(name)) return `工具 "${name}" 只属于桌面会话，QQ/运维 Agent 不可用`
       if (OPERATOR_DENY_TOOLS.includes(name) || /^dev_/.test(name)) return `工具 "${name}" 不允许在运维 Agent 中使用（派生 agent / 编排 / 插件 / 调度类）`
       if (['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'str_replace_editor'].includes(name)) return protectedFileReason(exec)
       return undefined
@@ -239,12 +256,17 @@ export function apply(ctx, config = {}) {
       console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`)
     }
   }
+  // 桌面专用 MCP 工具也一并从 schema 隐藏（前缀白名单会放行它们，restrict 才挡得住）。
+  for (const name of QQ_DENY_EXACT) {
+    try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
+  }
 
   // 2) 执行期白名单：任何不在允许范围内的工具调用都会被拒绝。
   ctx.tools.guard((exec) => {
     const name = exec?.name
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
     if (SAFE_EXACT.has(name)) return
+    if (QQ_DENY_EXACT.includes(name)) return `工具 "${name}" 只属于桌面会话（录音/本机登录态），QQ 会话不可用`
     if (extraAllowed.has(name)) return protectedFileReason(exec)
     if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
     if (readonlyAgent) return `工具 "${name}" 不在 L1 只读 Agent 白名单内，已拒绝（L1 只允许读文件/检索/联网只读；需要写入或执行命令请让 owner 在 QQ 私聊用 /level L2 申请提升）`
