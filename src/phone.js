@@ -189,10 +189,21 @@ export async function key(cfg, code) {
 export async function inputText(cfg, text) {
   const value = String(text ?? '');
   if (!value) throw new Error('text 不能为空');
-  // adb input text 不支持空格与中文，空格用 %s 代替；中文需要输入法（ADBKeyboard）
-  const encoded = value.replace(/ /g, '%s');
-  await adbFor(cfg, ['shell', 'input', 'text', encoded]);
-  return { ok: true, hint: /[\u4e00-\u9fa5]/.test(value) ? '中文可能没上屏：adb 不支持直接输入中文，需装 ADBKeyboard 并切换输入法' : undefined };
+  // 纯 ASCII（不含空格）走 input text 最稳；含中文/emoji/空格时走 ADBKeyboard 的
+  // 广播接口（ADB_INPUT_B64 用 base64 传，避开引号与空格转义）。ADBKeyboard 必须
+  // 已安装并被设为当前输入法（scripts 里装过 com.android.adbkeyboard）。
+  const asciiOnly = /^[\x21-\x7E]+$/.test(value);
+  if (asciiOnly) {
+    await adbFor(cfg, ['shell', 'input', 'text', value]);
+    return { ok: true, method: 'input_text' };
+  }
+  const base64 = Buffer.from(value, 'utf8').toString('base64');
+  try {
+    await adbFor(cfg, ['shell', 'am', 'broadcast', '-a', 'ADB_INPUT_B64', '--es', 'msg', base64]);
+    return { ok: true, method: 'adbkeyboard', hint: '已用 ADBKeyboard 广播输入（需要它保持为当前输入法）' };
+  } catch (error) {
+    throw new Error(`ADBKeyboard 输入失败：${error?.message ?? error}（先确认已装 ADBKeyboard 并设为输入法）`);
+  }
 }
 
 export async function openApp(cfg, target) {
