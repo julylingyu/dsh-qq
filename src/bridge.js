@@ -3191,6 +3191,8 @@ async function main() {
 
   function maybeArchiveSessionDaily(key) {
     if (cfg.sessionDailyReset === false) return false;
+    // 测试脚手架 / 老状态里可能没有这个字段；这里兜底建一次，别让 ensureSession 崩。
+    if (!state.sessionStartedAt || typeof state.sessionStartedAt !== 'object') state.sessionStartedAt = {};
     const sid = state.sessions[key];
     if (!sid) return false;
     const startedAt = Number(state.sessionStartedAt?.[key]) || 0;
