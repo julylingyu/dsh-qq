@@ -20,6 +20,8 @@ import { z } from 'zod';
 import { SENSITIVE_RE } from './sensitive.js';
 import { serializeModelData } from './qq-model-view.js';
 import { resolveDiaryDir, writeDiary, readRecentDiary, hasWrittenToday } from './diary.js';
+import { hearSystemAudio } from './hearing.js';
+import { fetchVideoInfo, fetchDanmaku } from './bili.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1673,6 +1675,51 @@ if (getConfig().socialV2?.tools?.diary !== false) {
         };
       } catch (error) {
         return { content: [{ type: 'text', text: `读日记失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (getConfig().socialV2?.tools?.hearing !== false) {
+  server.tool(
+    'qq_hear_audio',
+    '录下这台电脑当前正在播放的声音（WASAPI 环形回录）并转写成文字。适合「视频/直播/语音在放，但你看不到内容」时听一段。默认 8 秒；只对说话有效，纯音乐只能得到零碎词。',
+    { seconds: z.number().min(2).max(30).optional().describe('录几秒，默认 8') },
+    async ({ seconds }) => {
+      const c = getConfig();
+      const h = c.socialV2?.hearing ?? {};
+      const r = await hearSystemAudio({
+        seconds: Number(seconds) || Number(h.seconds) || 8,
+        python: h.python || 'C:/Users/15031/.dsh/voice-studio-venv/Scripts/python.exe',
+        ffmpegPath: h.ffmpegPath || 'E:/Program Files/oopz/ffmpeg.exe',
+        model: h.model || 'C:/Users/15031/.dsh/whisper/faster-whisper-small',
+        gainDb: Number(h.gainDb) || 18,
+        scriptDir: ROOT,
+        log: () => {},
+      });
+      return { content: [{ type: 'text', text: serializeModelData(r) }], isError: r.ok === false };
+    }
+  );
+}
+
+if (getConfig().socialV2?.tools?.bili !== false) {
+  server.tool(
+    'qq_bili_video',
+    '读一个 B站 视频的信息：标题、UP、时长、简介、热门评论；可选热弹幕。B站 链接、BV 号、av 号都行。字幕需要配置 SESSDATA，没有就先用简介+评论+弹幕判断内容。',
+    {
+      input: z.string().describe('视频链接或 BV 号'),
+      danmaku: z.number().min(0).max(50).optional().describe('顺便取多少条热弹幕，默认 0'),
+    },
+    async ({ input, danmaku }) => {
+      try {
+        const c = getConfig();
+        const info = await fetchVideoInfo(input, { sessdata: c.socialV2?.bili?.sessdata ?? '' });
+        if (info.ok && danmaku > 0) {
+          try { info.danmaku = await fetchDanmaku(info.cid, { limit: danmaku }); } catch (e) { info.danmaku = { ok: false, error: String(e?.message ?? e) }; }
+        }
+        return { content: [{ type: 'text', text: serializeModelData(info) }], isError: info.ok === false };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读 B站 视频失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
