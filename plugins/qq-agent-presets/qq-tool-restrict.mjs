@@ -181,6 +181,10 @@ export const QQ_DENY_EXACT = Object.freeze([
   'qq_bili_watch',
 ])
 
+// restrict/guard 拿到的是**带命名空间的真实工具名**（mcp__snowluma__qq_hear_audio），
+// 所以裸名和前缀名都要收，否则名单形同虚设（2026-10-25 实测踩过：只写裸名 → guard ALLOWED）。
+const QQ_DENY_NAMES = new Set(QQ_DENY_EXACT.flatMap((name) => [name, `mcp__snowluma__${name}`]))
+
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
 // todo_write 仅维护任务列表。若后续 preset 不再挂载这些工具，保留无害。
 const SAFE_EXACT = new Set([
@@ -223,13 +227,13 @@ export function apply(ctx, config = {}) {
     for (const name of OPERATOR_DENY_TOOLS) {
       try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
     }
-    for (const name of QQ_DENY_EXACT) {
+    for (const name of QQ_DENY_NAMES) {
       try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
     }
     ctx.tools.guard((exec) => {
       const name = exec?.name
       if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
-      if (QQ_DENY_EXACT.includes(name)) return `工具 "${name}" 只属于桌面会话，QQ/运维 Agent 不可用`
+      if (QQ_DENY_NAMES.has(name)) return `工具 "${name}" 只属于桌面会话，QQ/运维 Agent 不可用`
       if (OPERATOR_DENY_TOOLS.includes(name) || /^dev_/.test(name)) return `工具 "${name}" 不允许在运维 Agent 中使用（派生 agent / 编排 / 插件 / 调度类）`
       if (['read', 'read_image', 'glob', 'grep', 'write', 'edit', 'str_replace_editor'].includes(name)) return protectedFileReason(exec)
       return undefined
@@ -257,7 +261,7 @@ export function apply(ctx, config = {}) {
     }
   }
   // 桌面专用 MCP 工具也一并从 schema 隐藏（前缀白名单会放行它们，restrict 才挡得住）。
-  for (const name of QQ_DENY_EXACT) {
+  for (const name of QQ_DENY_NAMES) {
     try { ctx.tools.restrict({ deny: [name] }) } catch (error) { console.error(`[qq-tool-restrict] skip restrict ${name}: ${error?.message ?? error}`) }
   }
 
@@ -266,10 +270,11 @@ export function apply(ctx, config = {}) {
     const name = exec?.name
     if (typeof name !== 'string' || name.length === 0) return '工具名无效，已拒绝'
     if (SAFE_EXACT.has(name)) return
-    if (QQ_DENY_EXACT.includes(name)) return `工具 "${name}" 只属于桌面会话（录音/本机登录态），QQ 会话不可用`
+    if (QQ_DENY_NAMES.has(name)) return `工具 "${name}" 只属于桌面会话（录音/本机登录态），QQ 会话不可用`
     if (extraAllowed.has(name)) return protectedFileReason(exec)
     if (SAFE_PREFIXES.some((prefix) => name.startsWith(prefix))) return
     if (readonlyAgent) return `工具 "${name}" 不在 L1 只读 Agent 白名单内，已拒绝（L1 只允许读文件/检索/联网只读；需要写入或执行命令请让 owner 在 QQ 私聊用 /level L2 申请提升）`
     return `工具 "${name}" 不在 QQ 桥接白名单内，已拒绝（仅允许 QQ MCP 工具与无害模型侧工具）`
   })
 }
+
