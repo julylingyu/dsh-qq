@@ -68,7 +68,7 @@ server.tool(
       const shot = await screenshot(cfg());
       return {
         content: [
-          { type: 'image', data: shot.base64, mimeType: 'image/png' },
+          { type: 'image', data: shot.base64, mimeType: shot.mimeType ?? 'image/png' },
           { type: 'text', text: JSON.stringify({ ok: true, path: shot.path, bytes: shot.bytes }, null, 2) },
         ],
       };

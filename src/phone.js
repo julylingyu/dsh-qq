@@ -22,6 +22,8 @@ export function resolvePhoneConfig(cfg = {}) {
     address: String(p.address || process.env.QQ_ADB_ADDRESS || DEFAULT_ADDRESS),
     autoConnect: p.autoConnect !== false,
     screenshotDir: String(p.screenshotDir || path.join(os.tmpdir(), 'qq-phone-shots')),
+    ffmpegPath: String(p.ffmpegPath || process.env.FFMPEG_PATH || 'E:\\Program Files\\oopz\\ffmpeg.exe'),
+    maxInlineBytes: Number(p.maxInlineBytes) || 900 * 1024,
     timeoutMs: Number(p.timeoutMs) || 20000,
   };
 }
@@ -83,15 +85,38 @@ async function adbFor(cfg, args) {
   return { device, result: await runAdb(cfg, full) };
 }
 
-/** 截屏，返回 { path, base64, bytes }。 */
+/** 截屏，返回 { path, base64, bytes, mimeType }。
+ *  模拟器原始 PNG 常有 4MB+，直接塞给模型会失败（MCP/上下文都扛不住），
+ *  所以超过阈值就用 ffmpeg 缩到 900px 宽的 JPEG 再返回。 */
 export async function screenshot(cfg) {
   const { result } = await adbFor(cfg, ['exec-out', 'screencap', '-p']);
   const png = result.buffer;
   if (!png.length || png[0] !== 0x89) throw new Error('截图失败：返回的不是 PNG（模拟器未就绪？）');
   fs.mkdirSync(cfg.screenshotDir, { recursive: true });
-  const file = path.join(cfg.screenshotDir, `screen-${Date.now()}.png`);
+  const stamp = Date.now();
+  const file = path.join(cfg.screenshotDir, `screen-${stamp}.png`);
   fs.writeFileSync(file, png);
-  return { path: file, base64: png.toString('base64'), bytes: png.length };
+  const maxInlineBytes = Number(cfg.maxInlineBytes) || 900 * 1024;
+  if (png.length <= maxInlineBytes || !cfg.ffmpegPath || !fs.existsSync(cfg.ffmpegPath)) {
+    return { path: file, base64: png.toString('base64'), bytes: png.length, mimeType: 'image/png' };
+  }
+  const jpeg = path.join(cfg.screenshotDir, `screen-${stamp}.jpg`);
+  try {
+    await runFfmpeg(cfg.ffmpegPath, ['-y', '-i', file, '-vf', 'scale=900:-1', '-q:v', '4', jpeg], cfg.timeoutMs);
+    const buf = fs.readFileSync(jpeg);
+    return { path: jpeg, base64: buf.toString('base64'), bytes: buf.length, mimeType: 'image/jpeg', original: file };
+  } catch {
+    return { path: file, base64: png.toString('base64'), bytes: png.length, mimeType: 'image/png' };
+  }
+}
+
+function runFfmpeg(ffmpegPath, args, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore'] });
+    const timer = setTimeout(() => { try { child.kill(); } catch {} reject(new Error('ffmpeg 超时')); }, timeoutMs);
+    child.on('error', (e) => { clearTimeout(timer); reject(e); });
+    child.on('close', (code) => { clearTimeout(timer); code === 0 ? resolve() : reject(new Error(`ffmpeg 退出码 ${code}`)); });
+  });
 }
 
 function parseBounds(value) {
