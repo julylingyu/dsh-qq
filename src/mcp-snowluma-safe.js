@@ -22,6 +22,7 @@ import { serializeModelData } from './qq-model-view.js';
 import { resolveDiaryDir, writeDiary, readRecentDiary, hasWrittenToday } from './diary.js';
 import { hearSystemAudio } from './hearing.js';
 import { fetchVideoInfo, fetchDanmaku } from './bili.js';
+import { runBiliWatch } from './bili-watch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -1721,6 +1722,22 @@ if (getConfig().socialV2?.tools?.bili !== false) {
       } catch (error) {
         return { content: [{ type: 'text', text: `读 B站 视频失败：${error?.message ?? error}` }], isError: true };
       }
+    }
+  );
+
+  // dsh-bili-watch 的 CLI 版（不在 profile 里，避免 dsh-tools 双实例把宿主工具链搞断）。
+  // 比 qq_bili_video 多：热榜、搜索、评论区、弹幕热区、多 P、字幕（要扫码登录）。
+  server.tool(
+    'qq_bili_watch',
+    '用 bili-watch 命令行读 B站：view 看元数据+热评 / peek 看标题+5帧 / comments 评论区 / danmaku 弹幕热区 / search 搜视频 / hot 热门榜 / sub 字幕（需先扫码登录）。返回的是命令原文。',
+    {
+      action: z.enum(['view', 'peek', 'comments', 'danmaku', 'search', 'hot', 'sub']).describe('要做的事'),
+      input: z.string().optional().describe('BV 号/链接（search 时填关键词；hot 可省略）'),
+      limit: z.number().min(1).max(30).optional().describe('search/hot 的条数'),
+    },
+    async ({ action, input, limit }) => {
+      const r = await runBiliWatch(action, input, { limit, cfg: getConfig() });
+      return { content: [{ type: 'text', text: r.ok ? r.text : `bili-watch 失败：${r.error}` }], isError: r.ok === false };
     }
   );
 }
