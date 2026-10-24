@@ -49,5 +49,31 @@ if (-not (PortUp 3100) -and -not (ProcUp 'src[\\/]bridge\.js')) {
   Note 'bridge: already listening on 3100'
 }
 
+# Hindsight memory daemon (port 9077). It is a side process that does not survive
+# a DSH update/restart, and the hourly-ish page refresh silently stops working
+# without it. Start it hidden through the same wrapper; skip when a process exists
+# so a slow startup cannot spawn duplicates.
+$hidden = 'E:\dsh\dsh-qq\scripts\run-hidden.vbs'
+if (-not (PortUp 9077) -and -not (ProcUp 'hindsight')) {
+  $uvx = $null
+  try { $uvx = (Get-Command uvx -ErrorAction SilentlyContinue).Source } catch {}
+  if ($uvx) {
+    $cmd = '"' + $uvx + '" hindsight-embed@latest daemon start --profile coding-agent'
+    Start-Process -FilePath 'wscript.exe' -ArgumentList ('"' + $hidden + '" "' + $cmd + '"')
+    Note 'hindsight: starting daemon (hidden)'
+    for ($i = 0; $i -lt 45; $i++) {
+      Start-Sleep -Seconds 2
+      if (PortUp 9077) { Note ('hindsight: up after ' + (($i + 1) * 2) + 's'); break }
+    }
+  } else {
+    Note 'hindsight: uvx not found on PATH (skip)'
+  }
+} elseif (PortUp 9077) {
+  Note 'hindsight: already listening on 9077'
+} else {
+  Note 'hindsight: process running but 9077 not up yet (skip relaunch)'
+}
+if (-not (PortUp 9077)) { Note 'hindsight: NOT up after 90s (continuing anyway)' }
+
 Start-Sleep -Seconds 3
-Note ('autostart: done  gateway3000=' + (PortUp 3000) + '  bridge3100=' + (PortUp 3100))
+Note ('autostart: done  gateway3000=' + (PortUp 3000) + '  bridge3100=' + (PortUp 3100) + '  hindsight9077=' + (PortUp 9077))
