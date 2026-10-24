@@ -82,12 +82,19 @@ const EXPRESSION = `(() => {
   // 新版网易云（Orpheus）播放条的类名一直在变，所以先试一批常见选择器，
   // 再退回 document.title —— 它播放时会被改成「歌名 - 歌手 - 网易云音乐」，最稳。
   let title = pick([
+    '.title-playing', '[class*="title-playing"]',
     '.m-playbar .words .name a', '.m-playbar .words .name', '.playbar .words .name',
     '.songName', '.song-name', '[class*="songName"]', '[class*="nowPlaying"] [class*="name"]',
     '.player-bar .name', '.title',
   ]);
-  let artist = pick(['.m-playbar .words .by a', '.m-playbar .words .by', '.songName .artist', '.artist', '.singerName', '[class*="singer"]']);
-  const lyric = pick(['.lyric-current', '.current-lyric', '.m-playbar .lyric .current', '.lyric .active', '[class*="lyric"] .active', '.lyric']);
+  let artist = pick([
+    '.sub-title-playing', '[class*="sub-title-playing"]', '.artists',
+    '.m-playbar .words .by a', '.m-playbar .words .by', '.songName .artist', '.artist', '.singerName', '[class*="singer"]',
+  ]);
+  const lyric = pick([
+    '.lyric-current', '.current-lyric', '.m-playbar .lyric .current',
+    '.lyric .active', '[class*="lyric"] .active', '[class*="Lyric"] [class*="current"]',
+  ]);
   const docTitle = String(document.title || '').replace(/\\s*-\\s*网易云音乐\\s*$/, '').trim();
   if (!title && docTitle && docTitle !== '网易云音乐') {
     const parts = docTitle.split(/\\s+-\\s+/);
