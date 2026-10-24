@@ -18,6 +18,7 @@ export function resolveBiliWatchConfig(cfg = {}) {
     dir: path.resolve(String(b.cliDir || 'E:\\dsh\\tools\\dsh-bili-watch')),
     timeoutMs: Number(b.cliTimeoutMs) || 60000,
     maxChars: Number(b.cliMaxChars) || 6000,
+    ffmpegPath: String(b.ffmpegPath || 'E:\\Program Files\\oopz\\ffmpeg.exe'),
   };
 }
 
@@ -53,11 +54,12 @@ function run(args, { dir, timeoutMs }) {
  * @param {'view'|'peek'|'comments'|'danmaku'|'search'|'hot'|'sub'} action
  * @param {string} target  BV 号/链接（search 时是关键词，hot 时忽略）
  */
-export async function runBiliWatch(action, target, { limit, format, outDir, cfg = {}, log = () => {} } = {}) {
+export async function runBiliWatch(action, target, { limit, format, outDir, step, cfg = {}, log = () => {} } = {}) {
   const c = resolveBiliWatchConfig(cfg);
   if (!c.enabled) return { ok: false, error: 'bili 的 CLI 已关闭（socialV2.bili.cliEnabled=false）' };
   const args = [action];
   let outFile = '';
+  let framesDir = '';
   if (action === 'hot') {
     if (limit) args.push('--limit', String(limit));
   } else if (action === 'search') {
@@ -71,6 +73,17 @@ export async function runBiliWatch(action, target, { limit, format, outDir, cfg 
   } else {
     if (!target) return { ok: false, error: `${action} 需要 BV 号或链接` };
     args.push(String(target));
+    if (['frames', 'ocr', 'peek', 'asr'].includes(action) && c.ffmpegPath && fs.existsSync(c.ffmpegPath)) {
+      args.push('--ffmpeg', c.ffmpegPath);
+    }
+    if (action === 'frames' || action === 'ocr') {
+      const dir = path.resolve(outDir || path.join(c.dir, 'frames'));
+      fs.mkdirSync(dir, { recursive: true });
+      const safe = String(target).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40) || 'video';
+      framesDir = path.join(dir, `${safe}-${Date.now()}`);
+      args.push('--out', framesDir);
+      if (step) args.push('--step', String(step));
+    }
     // 字幕：srt/md 带时间戳与跳转链接，直接落盘再回一段开头，避免把整篇塞进上下文。
     if (action === 'sub' && format) {
       const fmt = String(format).toLowerCase();
@@ -94,6 +107,14 @@ export async function runBiliWatch(action, target, { limit, format, outDir, cfg 
     if (outFile) {
       result.path = outFile;
       result.savedChars = fs.existsSync(outFile) ? fs.statSync(outFile).size : 0;
+    }
+    if (framesDir) {
+      const files = fs.existsSync(framesDir)
+        ? fs.readdirSync(framesDir).filter((f) => /\.(jpg|jpeg|png)$/i.test(f)).map((f) => path.join(framesDir, f))
+        : [];
+      result.dir = framesDir;
+      result.frames = files;
+      result.frameCount = files.length;
     }
     return result;
   } catch (error) {

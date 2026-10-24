@@ -1724,17 +1724,21 @@ if (getConfig().socialV2?.tools?.bili !== false) {
   // CLI 不可用时对 view/comments/danmaku 退回接口实现，避免模型在两种工具间乱选。
   server.tool(
     'qq_bili_watch',
-    '读 B站：view 元数据+热评 / peek 标题+5帧 / comments 评论区 / danmaku 弹幕热区 / search 搜视频 / hot 热门榜 / sub 字幕（需先扫码登录，format=md 带时间戳）。CLI 不可用时 view/comments/danmaku 自动退回接口实现。',
+    '读 B站：view 元数据+热评 / peek 标题+5帧 / frames 抽帧 / ocr 抽帧+OCR（需装 OCR 环境）/ comments 评论区 / danmaku 弹幕热区 / search 搜视频 / hot 热门榜 / sub 字幕（需先扫码登录，format=md 带时间戳）。CLI 不可用时 view/comments/danmaku 自动退回接口实现。',
     {
-      action: z.enum(['view', 'peek', 'comments', 'danmaku', 'search', 'hot', 'sub']).describe('要做的事'),
+      action: z.enum(['view', 'peek', 'frames', 'ocr', 'comments', 'danmaku', 'search', 'hot', 'sub']).describe('要做的事'),
       input: z.string().optional().describe('BV 号/链接（search 时填关键词；hot 可省略）'),
       limit: z.number().min(1).max(30).optional().describe('search/hot 的条数'),
       format: z.enum(['text', 'srt', 'md', 'json', 'txt']).optional().describe('sub 专用：srt/md 带时间戳（md 可跳回原片），会落盘并返回路径'),
+      step: z.number().min(1).max(120).optional().describe('frames/ocr 专用：每隔几秒抽一帧'),
     },
-    async ({ action, input, limit, format }) => {
-      const r = await runBiliWatch(action, input, { limit, format, cfg: getConfig() });
+    async ({ action, input, limit, format, step }) => {
+      const r = await runBiliWatch(action, input, { limit, format, step, cfg: getConfig() });
       if (r.ok) {
-        const text = r.path ? `${r.text}\n\n[已保存] ${r.path}（${r.savedChars} 字节）` : r.text;
+        const extras = [];
+        if (r.path) extras.push(`[已保存] ${r.path}（${r.savedChars} 字节）`);
+        if (r.dir) extras.push(`[帧目录] ${r.dir}（${r.frameCount} 张）\n${(r.frames || []).slice(0, 12).join('\n')}`);
+        const text = extras.length ? `${r.text}\n\n${extras.join('\n')}` : r.text;
         return { content: [{ type: 'text', text }] };
       }
       try {
