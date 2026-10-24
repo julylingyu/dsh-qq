@@ -30,6 +30,19 @@ export function defaultAsrPython() {
   return '';
 }
 
+/** 本地已下载的 faster-whisper 模型目录（有 model.bin 才算），没有就返回空串。 */
+export function localModelDir(name) {
+  const base = process.env.DSH_WHISPER_DIR || path.join(os.homedir(), '.dsh', 'whisper');
+  for (const candidate of [String(name ?? ''), `faster-whisper-${String(name ?? '')}`]) {
+    if (!candidate) continue;
+    const dir = path.isAbsolute(candidate) ? candidate : path.join(base, candidate);
+    try {
+      if (fs.existsSync(path.join(dir, 'model.bin'))) return dir;
+    } catch {}
+  }
+  return '';
+}
+
 function cacheGet(key) {
   const hit = cache.get(key);
   if (!hit) return undefined;
@@ -49,11 +62,12 @@ function cacheSet(key, text) {
 }
 
 /** 跑一次 whisper 转写（faster-whisper，venv python）。 */
-function runWhisper({ python, script, audio, model, language, timeoutMs = 120000 }) {
+function runWhisper({ python, script, audio, model, language, timeoutMs = 120000, env = {} }) {
   return new Promise((resolve, reject) => {
     const child = spawn(python, [script, audio, '--model', model, '--language', language], {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      env: { ...process.env, ...env },
     });
     let out = '';
     let err = '';
@@ -109,14 +123,27 @@ export async function transcribeRecord({ call, file, asr = {}, script, log = () 
     if (!base64) throw new Error('get_record 没有返回 base64 音频');
     const audio = path.join(os.tmpdir(), `qq-voice-${Date.now()}-${Math.random().toString(16).slice(2)}.wav`);
     fs.writeFileSync(audio, Buffer.from(base64, 'base64'));
+    const modelName = asr.model || 'small';
+    const modelPath = localModelDir(modelName) || modelName;
     try {
       const text = await runWhisper({
         python,
         script,
         audio,
-        model: asr.model || 'small',
+        model: modelPath,
         language: asr.language || 'zh',
         timeoutMs: Number(asr.timeoutMs) || 120000,
+        // 模型第一次要从 HuggingFace 下（后面走本地缓存）。本机走 Clash 代理，
+        // 并且用 hf-mirror；HF_HUB_DISABLE_XET=1 是 Hindsight 那边踩过的坑（Xet CAS 401）。
+        // 本地已经有模型目录时直接离线跑，避免每次先探一次 Hub。
+        env: {
+          ...(asr.proxy ? { HTTPS_PROXY: asr.proxy, HTTP_PROXY: asr.proxy } : {}),
+          HF_ENDPOINT: asr.hfEndpoint || process.env.HF_ENDPOINT || 'https://hf-mirror.com',
+          HF_HUB_DISABLE_XET: '1',
+          ...(localModelDir(modelName) ? { HF_HUB_OFFLINE: '1' } : {}),
+          // Windows 上 py 默认用 GBK 打印，桥接按 UTF-8 读 → 会变成乱码
+          PYTHONIOENCODING: 'utf-8',
+        },
       });
       cacheSet(raw, text);
       if (text) log(`[asr] 语音转写：${text.slice(0, 60)}${text.length > 60 ? '…' : ''}`);

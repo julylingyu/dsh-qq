@@ -28,6 +28,12 @@ def main() -> int:
         model = WhisperModel(args.model, device="cpu", compute_type="int8")
         segments, _info = model.transcribe(args.audio, language=args.language, vad_filter=True)
         text = "".join(seg.text for seg in segments).strip()
+        # whisper 经常输出繁体（教程坑 11），有 opencc 就转简体，没有就原样返回。
+        try:
+            from opencc import OpenCC
+            text = OpenCC("t2s").convert(text)
+        except Exception:
+            pass
         print(text)
         return 0
     except Exception as exc:  # pragma: no cover
