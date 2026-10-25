@@ -1,4 +1,4 @@
-// QQ ↔ DeepSeek Harness 桥接主程序。
+﻿// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -4135,7 +4135,16 @@ async function main() {
             if (qk) {
               // 调试用：直接把某个会话会注入的覆盖块吐出来，省得靠真发消息验证。
               const persona = personaOverrideFor(qk);
-              sendJson({ ok: true, key: qk, name: map[qk] ?? null, chars: persona.length, persona: persona.slice(0, 400) });
+              const stateBlock = personaStateLine(qk);
+              sendJson({
+                ok: true,
+                key: qk,
+                name: map[qk] ?? null,
+                chars: persona.length,
+                persona: persona.slice(0, 400),
+                state: personaStateFor(qk),
+                stateBlock: stateBlock.slice(0, 300),
+              });
               return;
             }
             sendJson({ ok: true, map, roles });
@@ -5910,6 +5919,13 @@ async function main() {
           const messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
+          // 人格覆盖会话：剥掉模型自写的 ✦LVX|分数✦ 前缀，并给本场加 1 分。
+          if (cfg.socialV2?.personaBySession?.[key] && messages.length) {
+            for (let i = 0; i < messages.length; i += 1) messages[i] = stripPersonaPrefix(messages[i]);
+            const nonEmpty = messages.filter(Boolean);
+            if (nonEmpty.length !== messages.length) { messages.length = 0; messages.push(...nonEmpty); }
+            if (messages.length) applyPersonaOutput(key);
+          }
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
@@ -10776,6 +10792,94 @@ async function main() {
     }
   }
 
+  // ── 人格状态（好感度/形态/白饭冷却）：桥接侧维护，模型只读不写 ────────────
+  // 为什么放在桥接：大肥鱼 Pro 卡要求每条回复开头带 ✦LVX|分数✦，但模型自己记忆会漂
+  // （今天 100、明天 143）。这里把分数、形态、白饭冷却沉到 state/persona-state.json，
+  // 每轮提示词注入唯一可信值，发送时再把模型自己写的 ✦…✦ 前缀剥掉，避免两边打架。
+  const PERSONA_STATE_FILE = path.join(STATE_DIR, 'persona-state.json');
+  const PERSONA_RICE_COOLDOWN = 3;
+
+  function personaStateAll() {
+    try {
+      const raw = readJsonSafe(PERSONA_STATE_FILE, {});
+      return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function personaStateFor(key) {
+    const base = { score: 100, form: 'loli', riceLeft: 0, dead: false, updatedAt: 0 };
+    const cur = personaStateAll()[key];
+    return cur && typeof cur === 'object' ? { ...base, ...cur } : base;
+  }
+
+  function savePersonaState(key, next) {
+    const all = personaStateAll();
+    all[key] = { ...personaStateFor(key), ...next, updatedAt: Date.now() };
+    atomicWriteJson(PERSONA_STATE_FILE, all);
+    return all[key];
+  }
+
+  function bumpPersonaScore(key, delta) {
+    const st = personaStateFor(key);
+    const score = Math.max(0, Math.min(100, Number(st.score) + Number(delta)));
+    return savePersonaState(key, { score, dead: score <= 0 });
+  }
+
+  /** 用户消息 → 分数/形态/白饭冷却。只在配置了人格覆盖的会话生效。 */
+  function applyPersonaInput(key, text) {
+    try {
+      if (!cfg.socialV2?.personaBySession?.[key]) return;
+      const t = String(text ?? '');
+      const st = personaStateFor(key);
+      let score = Number(st.score);
+      let form = st.form === 'oneesan' ? 'oneesan' : 'loli';
+      let riceLeft = Math.max(0, Number(st.riceLeft) || 0);
+      const hasRice = /🍚|米饭|大白饭|干饭/.test(t);
+      if (hasRice) {
+        score += 4;
+        riceLeft = PERSONA_RICE_COOLDOWN;
+      }
+      if (hasRice && /变长|变大|变小|变高|变矮|变短|变身|切换/.test(t)) {
+        form = form === 'oneesan' ? 'loli' : 'oneesan';
+      }
+      score = Math.max(0, Math.min(100, score));
+      savePersonaState(key, { score, form, riceLeft, dead: score <= 0 });
+    } catch (error) {
+      log(`[persona] 记录输入状态失败：${error?.message ?? error}`);
+    }
+  }
+
+  /** AI 发出一条消息 → +1，白饭冷却递减一场。 */
+  function applyPersonaOutput(key) {
+    try {
+      if (!cfg.socialV2?.personaBySession?.[key]) return;
+      const st = personaStateFor(key);
+      const riceLeft = Math.max(0, (Number(st.riceLeft) || 0) - 1);
+      bumpPersonaScore(key, 1);
+      savePersonaState(key, { riceLeft });
+    } catch (error) {
+      log(`[persona] 记录输出状态失败：${error?.message ?? error}`);
+    }
+  }
+
+  /** 剥掉模型自己写的 ✦LV2|120✦ 前缀（状态以桥接为准，不显示给群友）。 */
+  function stripPersonaPrefix(text) {
+    return String(text ?? '').replace(/^\s*✦[^✦]{0,40}✦\s*/u, '');
+  }
+
+  /** 注入给模型的唯一可信状态块。 */
+  function personaStateLine(key) {
+    if (!cfg.socialV2?.personaBySession?.[key]) return '';
+    const st = personaStateFor(key);
+    const formName = st.form === 'oneesan' ? '御姐态' : '萝莉态';
+    if (st.dead) return '【人格状态·桥接维护】分数 0（死机线）：只允许回“死了喵”。\n\n';
+    const rice = st.riceLeft > 0 ? `白饭冷却剩 ${st.riceLeft} 轮（这期间禁止提白饭）` : '白饭冷却已过';
+    return `【人格状态·桥接维护（唯一可信，禁止自行加减）】LV${st.score}|分数${st.score}|形态${formName}｜${rice}\n` +
+      '回复开头仍按角色卡带 ✦LVX|分数✦，但数字必须与上面完全一致；发送时桥接会把这段前缀剥掉。\n\n';
+  }
+
   // 二代仿真模式专用角色提示：去掉一代的 [SILENT] / 空格分句等状态机指令，避免与工具协议冲突。
   // 为了不削减原角色卡内容，示例节不整体删除，而是把“用空格分条”的示范改写成“用逗号表示停顿”，
   // 让二代 AI 既保留原有人格示例，又不会照抄单条消息里的中文空格。
@@ -11214,6 +11318,7 @@ async function main() {
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
+    applyPersonaInput(key, String(plainContent ?? textContent ?? ''));
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
@@ -11263,6 +11368,7 @@ async function main() {
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
+    applyPersonaInput(key, String(plainContent ?? textContent ?? ''));
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     saveSocialV2State();
     return msg;
@@ -11619,7 +11725,7 @@ async function main() {
     const diaryLine = diaryText ? `${diaryText}\n\n` : '';
     // 耳朵：定时器刷新的同步缓存，没在播就是空串。
     const musicLine = buildMusicContext(lastMusic);
-    const base = roleLine + personaLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
+    const base = roleLine + personaLine + personaStateLine(key) + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -11653,7 +11759,7 @@ async function main() {
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${personaLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${personaLine}${personaStateLine(key)}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   async function sendWakePromptV2(key, reason) {
@@ -12798,6 +12904,7 @@ async function main() {
     st.recentMessages.push(msg);
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
+    applyPersonaInput(key, String(plainContent ?? textContent ?? ''));
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
     saveSocialV2State();
     return msg;
