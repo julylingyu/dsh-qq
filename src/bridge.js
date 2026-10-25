@@ -1,4 +1,4 @@
-﻿// QQ ↔ DeepSeek Harness 桥接主程序。
+// QQ ↔ DeepSeek Harness 桥接主程序。
 //
 // 链路：
 //   QQ 消息 → SnowLuma (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
@@ -7357,6 +7357,7 @@ async function main() {
             return;
           }
           // person-note：只能写到当前会话的作用域；share=true 只是「申请」跨群共享，需管理员批准。
+          if (memoryBlockedFor(key)) { sendJson({ ok: false, error: '该会话已屏蔽记忆（隔离测试），不写人物档案', blocked: true }, 403); return; }
           const content = String(body.content ?? '').trim();
           if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
           if (SENSITIVE_RE.test(content)) { sendJson({ ok: false, error: '内容疑似含路径/凭据，拒绝记录' }, 400); return; }
@@ -7611,6 +7612,7 @@ async function main() {
           const content = String(body.content ?? '').trim();
           const extra = body.extra && typeof body.extra === 'object' ? body.extra : {};
           if (!key || !category || !content) { sendJson({ ok: false, error: 'key/category/content 不能为空' }, 400); return; }
+          if (memoryBlockedFor(key)) { sendJson({ ok: false, error: '该会话已屏蔽记忆（隔离测试），不写轻量记忆', blocked: true }, 403); return; }
           if (!['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
           if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
           if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
@@ -10027,6 +10029,15 @@ async function main() {
     return defaultMs;
   }
 
+  /**
+   * 隔离测试会话：不读也不写长期记忆（群内轻量记忆、人物档案、日记），
+   * 由 cfg.socialV2.memoryBlockedSessions 列出 key。
+   */
+  function memoryBlockedFor(key) {
+    const list = cfg.socialV2?.memoryBlockedSessions;
+    return Array.isArray(list) && list.includes(String(key ?? ''));
+  }
+
   function formatMemoryV2(st) {
     if (!st) return '';
     const lines = [];
@@ -10884,9 +10895,13 @@ async function main() {
     const st = personaStateFor(key);
     const formName = st.form === 'oneesan' ? '御姐态' : '萝莉态';
     if (st.dead) return '【人格状态·桥接维护】分数 0（死机线）：只允许回“死了喵”。\n\n';
-    const rice = st.riceLeft > 0 ? `白饭冷却剩 ${st.riceLeft} 轮（这期间禁止提白饭）` : '白饭冷却已过';
-    return `【人格状态·桥接维护（唯一可信，禁止自行加减）】LV${st.score}|分数${st.score}|形态${formName}｜${rice}\n` +
-      '回复开头仍按角色卡带 ✦LVX|分数✦，但数字必须与上面完全一致；发送时桥接会把这段前缀剥掉。\n\n';
+    // ✦LVX|分数✦ 是「大肥鱼 Pro」那张卡的写法，只有卡本身要求时才提示；
+    // 小鲸鱼 v2 之类不写前缀的卡，注入状态但不能让模型往外贴 ✦。
+    const wantsPrefix = personaOverrideFor(key).includes('✦');
+    const head = `【人格状态·桥接维护（唯一可信，禁止自行加减）】LV${st.score}|分数${st.score}|形态${formName}｜${st.riceLeft > 0 ? `白饭冷却剩 ${st.riceLeft} 轮（这期间禁止提白饭）` : '白饭冷却已过'}\n`;
+    return wantsPrefix
+      ? head + '回复开头仍按角色卡带 ✦LVX|分数✦，但数字必须与上面完全一致；发送时桥接会把这段前缀剥掉。\n\n'
+      : head + '以上状态只供你自己把握，不要写进消息里（不加分数、不加形态、不加任何符号标签）。\n\n';
   }
 
   // 二代仿真模式专用角色提示：去掉一代的 [SILENT] / 空格分句等状态机指令，避免与工具协议冲突。
@@ -11682,7 +11697,11 @@ async function main() {
     const personaLine = personaOverrideFor(key);
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
-    const memoryText = formatMemoryV2(st);
+    const memBlocked = memoryBlockedFor(key);
+    const memoryText = memBlocked ? '' : formatMemoryV2(st);
+    const blockedLine = memBlocked
+      ? '【本会话记忆已屏蔽】这是一场隔离测试：长期记忆、人物档案、日记都不参与，也不要调用 qq_memory_append / qq_note_person / qq_write_diary。按眼前的消息聊，别假装记得以前的事。\n\n'
+      : '';
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     // v0.3.0 在场人物：只注入本轮未读/最近消息里出现的人，并在注入时按共享策略过滤可见范围。
     const presentIds = [...(st.unread || []), ...(st.recentMessages || []).slice(-6)].filter((m) => m && !m.isSelf).map((m) => m.userId).filter(Boolean);
@@ -11730,11 +11749,11 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 日记：注入她自己写过的最近几篇（默认 3），让她记住自己写过什么；没有就空串。
     const diaryCfg = cfg.socialV2?.diary ?? {};
-    const diaryText = diaryCfg.inject === false ? '' : buildDiaryContext(resolveDiaryDir({ root: ROOT, configured: diaryCfg.dir }), Number(diaryCfg.injectCount) || 3);
+    const diaryText = (diaryCfg.inject === false || memBlocked) ? '' : buildDiaryContext(resolveDiaryDir({ root: ROOT, configured: diaryCfg.dir }), Number(diaryCfg.injectCount) || 3);
     const diaryLine = diaryText ? `${diaryText}\n\n` : '';
     // 耳朵：定时器刷新的同步缓存，没在播就是空串。
     const musicLine = buildMusicContext(lastMusic);
-    const base = roleLine + personaLine + personaStateLine(key) + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
+    const base = roleLine + personaLine + personaStateLine(key) + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + blockedLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
