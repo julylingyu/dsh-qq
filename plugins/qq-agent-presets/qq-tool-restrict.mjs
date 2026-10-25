@@ -1,4 +1,4 @@
-// QQ 桥接安全硬边界：只允许 QQ MCP 工具与少量无害模型侧工具。
+﻿// QQ 桥接安全硬边界：只允许 QQ MCP 工具与少量无害模型侧工具。
 //
 // 本文件是 qq-agent-presets bundle 里的**唯一权威实现**，由 qq-chat / qq-chat-v2 两个
 // agent preset 的 qq-tool-restrict 行共同引用（dsh/agent-presets/<preset>/qq-tool-restrict.mjs
@@ -179,6 +179,7 @@ const SAFE_PREFIXES = [
 export const QQ_DENY_EXACT = Object.freeze([
   'qq_hear_audio',
   'qq_bili_watch',
+  'qq_status',
 ])
 
 // restrict/guard 拿到的是**带命名空间的真实工具名**（mcp__snowluma__qq_hear_audio），
