@@ -5791,9 +5791,10 @@ async function main() {
               } catch {}
             }
           }
-          const messages = Array.isArray(rawMessages)
+          let messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (typeof rawMessages === 'string' ? [String(rawMessages).trim()].filter(Boolean) : []);
+          messages = personaPrepareOutgoing(key, messages);
           const replyToMessageId = body.replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             sendJson({ ok: false, error: 'qq_send_burst 暂不支持引用，请使用 qq_reply' }, 400);
@@ -5919,13 +5920,7 @@ async function main() {
           const messages = Array.isArray(rawMessages)
             ? rawMessages.map((m) => String(m ?? '').trim()).filter(Boolean)
             : (isRawString ? [String(rawMessages).trim()].filter(Boolean) : []);
-          // 人格覆盖会话：剥掉模型自写的 ✦LVX|分数✦ 前缀，并给本场加 1 分。
-          if (cfg.socialV2?.personaBySession?.[key] && messages.length) {
-            for (let i = 0; i < messages.length; i += 1) messages[i] = stripPersonaPrefix(messages[i]);
-            const nonEmpty = messages.filter(Boolean);
-            if (nonEmpty.length !== messages.length) { messages.length = 0; messages.push(...nonEmpty); }
-            if (messages.length) applyPersonaOutput(key);
-          }
+          messages.splice(0, messages.length, ...personaPrepareOutgoing(key, messages));
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           // 二代不再按空格自动分条：字符串就是一条消息，数组模式原样使用调用方间隔。
@@ -7928,6 +7923,11 @@ async function main() {
           const replyToMessageId = body.replyToMessageId;
           const atUserId = body.atUserId ?? null;
           const key = isPrivate ? `private:${targetId}` : `group:${targetId}`;
+          // 人格覆盖会话：发送前剥掉模型自写的 ✦LVX|分数✦ 前缀（key 已就绪）。
+          if (cfg.socialV2?.personaBySession?.[key]) {
+            const cleaned = personaPrepareOutgoing(key, [message])[0];
+            if (cleaned) message = cleaned;
+          }
           // 安全边界：发送工具只允许在 closed-agent（管理员私聊）或 reserved2（二代 AI 带会话令牌）下使用；
           // chat/reserved 的自动转发已覆盖正常回复，MCP 发送工具不应成为 prompt injection 的越权出口。
           if (currentMode === 'chat' || currentMode === 'reserved') {
@@ -10865,6 +10865,15 @@ async function main() {
   }
 
   /** 剥掉模型自己写的 ✦LV2|120✦ 前缀（状态以桥接为准，不显示给群友）。 */
+  /** 出站统一净化：剥离 ✦LVX|分数✦ 前缀，整批只记一次 +1。 */
+  function personaPrepareOutgoing(key, list) {
+    const arr = Array.isArray(list) ? list : [list];
+    if (!cfg.socialV2?.personaBySession?.[key]) return arr.map((s) => String(s ?? '')).filter(Boolean);
+    const out = arr.map((s) => stripPersonaPrefix(String(s ?? ''))).filter(Boolean);
+    if (out.length) applyPersonaOutput(key);
+    return out;
+  }
+
   function stripPersonaPrefix(text) {
     return String(text ?? '').replace(/^\s*✦[^✦]{0,40}✦\s*/u, '');
   }
