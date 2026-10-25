@@ -4126,6 +4126,44 @@ async function main() {
           }
           return;
         }
+        // 会话级人格覆盖：给某个群/私聊单独指定 roles/<名称>.md（其余会话沿用全局角色卡）。
+        if (url.pathname === '/api/persona') {
+          if (req.method === 'GET') {
+            const map = cfg.socialV2?.personaBySession ?? {};
+            const roles = fs.readdirSync(ROLES_DIR).filter((f) => f.endsWith('.md')).map((f) => f.slice(0, -3));
+            const qk = String(url.searchParams.get('key') ?? '').trim();
+            if (qk) {
+              // 调试用：直接把某个会话会注入的覆盖块吐出来，省得靠真发消息验证。
+              const persona = personaOverrideFor(qk);
+              sendJson({ ok: true, key: qk, name: map[qk] ?? null, chars: persona.length, persona: persona.slice(0, 400) });
+              return;
+            }
+            sendJson({ ok: true, map, roles });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await readBody();
+            const key = String(body.key ?? '').trim();
+            if (!/^(group|private):\d+$/.test(key)) { sendJson({ ok: false, error: 'key 形如 group:123 或 private:456' }, 400); return; }
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readConfigObject(configFile);
+            file.socialV2 = file.socialV2 ?? {};
+            const map = { ...(file.socialV2.personaBySession ?? {}) };
+            if (body.name) {
+              const name = sanitizeRoleName(body.name);
+              if (!fs.existsSync(path.join(ROLES_DIR, name + '.md'))) { sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400); return; }
+              map[key] = name;
+            } else {
+              delete map[key];
+            }
+            file.socialV2.personaBySession = map;
+            atomicWriteJson(configFile, file);
+            cfg.socialV2 = { ...(cfg.socialV2 ?? {}), personaBySession: map };
+            log(`控制台：${key} 的人格覆盖 → ${body.name ? map[key] : '恢复全局'}`);
+            sendJson({ ok: true, map });
+            return;
+          }
+        }
         if (req.method === 'POST' && url.pathname === '/api/role-mode') {
           const body = await readBody();
           const rs = readRoleState();
@@ -10716,6 +10754,28 @@ async function main() {
     return roleHintForMode('v1');
   }
 
+  // 按会话覆盖人格（例如某个群用「大肥鱼」、其余沿用全局角色卡）。
+  // 做法是**追加一段覆盖块**而不是替换全局角色卡：全局卡继续提供通用行为约束，
+  // 覆盖块只在本会话里、且明确声明优先级更高。文件同样过 sanitizeRoleName 防穿越。
+  function personaOverrideFor(key) {
+    try {
+      const map = cfg.socialV2?.personaBySession;
+      if (!map || typeof map !== 'object') return '';
+      const raw = map[key];
+      if (!raw) return '';
+      const name = sanitizeRoleName(raw);
+      if (!name || name.includes('..')) return '';
+      const file = path.join(ROLES_DIR, name + '.md');
+      if (!fs.existsSync(file)) return '';
+      const text = fs.readFileSync(file, 'utf8').trim();
+      if (!text) return '';
+      const capped = text.length > roleInjectMaxChars ? truncateText(text, roleInjectMaxChars) : text;
+      return `【本会话人格覆盖｜优先级高于上面的通用角色卡】\n${capped}\n\n`;
+    } catch {
+      return '';
+    }
+  }
+
   // 二代仿真模式专用角色提示：去掉一代的 [SILENT] / 空格分句等状态机指令，避免与工具协议冲突。
   // 为了不削减原角色卡内容，示例节不整体删除，而是把“用空格分条”的示范改写成“用逗号表示停顿”，
   // 让二代 AI 既保留原有人格示例，又不会照抄单条消息里的中文空格。
@@ -11504,6 +11564,7 @@ async function main() {
   function buildWakePromptV2Core(key, reason) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const personaLine = personaOverrideFor(key);
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
@@ -11558,7 +11619,7 @@ async function main() {
     const diaryLine = diaryText ? `${diaryText}\n\n` : '';
     // 耳朵：定时器刷新的同步缓存，没在播就是空串。
     const musicLine = buildMusicContext(lastMusic);
-    const base = roleLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
+    const base = roleLine + personaLine + identityLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + peopleLine + participationLine + diaryLine + musicLine + preSleepLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -11587,11 +11648,12 @@ async function main() {
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    const personaLine = personaOverrideFor(key);
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${personaLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   async function sendWakePromptV2(key, reason) {
